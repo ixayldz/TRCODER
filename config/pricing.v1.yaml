@@ -1,0 +1,37 @@
+version: pricing.v1
+
+plans:
+  pro_solo:
+    monthly_price_usd: 149
+    included_credits_trc: 100
+    payg_markup:
+      standard: 0.30
+      premium: 0.45
+      economy: 0.25
+
+  team:
+    monthly_price_usd: 299
+    included_credits_trc: 220
+    payg_markup:
+      standard: 0.28
+      premium: 0.42
+      economy: 0.22
+
+  enterprise:
+    monthly_price_usd: 499
+    included_credits_trc: 400
+    payg_markup:
+      standard: 0.25
+      premium: 0.38
+      economy: 0.18
+
+payg_only:
+  enabled: true
+  minimum_monthly_charge_usd: 10
+  markup:
+    standard: 0.35
+    premium: 0.55
+    economy: 0.25
+
+credit_definition:
+  trc_equals_provider_cost_usd: 1.0

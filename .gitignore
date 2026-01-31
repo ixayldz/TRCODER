@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.log
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Temp
+tmp/
+temp/
+*.tmp
+
+# Local runtime/state
+.trcoder/db.sqlite
+.trcoder/*.sqlite
+.trcoder/*.sqlite-journal
+.trcoder/patches/
+.trcoder/cache/
+.trcoder/tmp/

@@ -1,0 +1,26 @@
+version: verify.gates.v1
+
+modes:
+  targeted:
+    gates:
+      - typecheck
+      - tests:unit
+
+  standard:
+    gates:
+      - typecheck
+      - tests:all
+
+  strict:
+    gates:
+      - typecheck
+      - tests:all
+      - lint
+      - build
+
+commands:
+  typecheck: "pnpm -w typecheck"
+  tests:unit: "pnpm -w test -- --runInBand"
+  tests:all: "pnpm -w test"
+  lint: "pnpm -w lint"
+  build: "pnpm -w build"

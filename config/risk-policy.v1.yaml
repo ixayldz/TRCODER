@@ -1,0 +1,27 @@
+version: risk-policy.v1
+
+risk_levels:
+  low:
+    downgrade_allowed: true
+    min_allowed_tier: economy
+    verify_strictness: standard
+
+  standard:
+    downgrade_allowed: true
+    min_allowed_tier: standard
+    verify_strictness: standard
+
+  high:
+    downgrade_allowed: false
+    min_allowed_tier: premium
+    verify_strictness: strict
+    requires_confirmation: true
+
+high_risk_task_types:
+  - security_audit
+
+high_risk_path_patterns:
+  - "**/auth/**"
+  - "**/payments/**"
+  - "**/crypto/**"
+  - "**/access-control/**"

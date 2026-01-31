@@ -1,0 +1,16 @@
+{
+  "name": "trcoder",
+  "private": true,
+  "packageManager": "pnpm@9.12.1",
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "vitest run",
+    "lint": "pnpm -r lint"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  }
+}

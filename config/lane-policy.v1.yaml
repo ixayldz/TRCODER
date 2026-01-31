@@ -1,0 +1,32 @@
+version: lane-policy.v1
+
+lanes:
+  speed:
+    context_budget: { max_files: 20, max_lines: 900, graph_depth: 1, top_k: 10, hydrate: false }
+    verify_mode: targeted
+    fix_loop_max_iters: 2
+    model_overrides:
+      idea_validation: claude-opus-4.5
+      prd_creation: claude-opus-4.5
+      database_code: claude-sonnet-4.5
+      quick_review: claude-sonnet-4.5
+
+  balanced:
+    context_budget: { max_files: 40, max_lines: 1800, graph_depth: 2, top_k: 16, hydrate: false }
+    verify_mode: standard
+    fix_loop_max_iters: 3
+    model_overrides: {}
+
+  quality:
+    context_budget: { max_files: 60, max_lines: 2600, graph_depth: 3, top_k: 24, hydrate: true }
+    verify_mode: strict
+    fix_loop_max_iters: 3
+    review_burst:
+      enabled: true
+      reviewer_task_type: deep_review
+
+  cost-saver:
+    context_budget: { max_files: 25, max_lines: 1200, graph_depth: 1, top_k: 12, hydrate: false }
+    verify_mode: standard
+    fix_loop_max_iters: 2
+    downgrade_bias: true

@@ -1,0 +1,20 @@
+{
+  "name": "trcoder",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "trcoder": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "node ../../scripts/noop-lint.js"
+  },
+  "dependencies": {
+    "@trcoder/shared": "workspace:*",
+    "ws": "^8.16.0"
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "version": "tasks.v1",
+  "project": { "name": "trcoder" },
+  "plan_id": "plan_demo",
+  "repo_commit": "DEV",
+  "defaults": {
+    "context": { "graph_depth": 2, "top_k": 16, "max_files": 40, "max_lines": 1800 },
+    "verify": { "gates_mode": "standard" },
+    "fix_loop": { "max_iters": 3 }
+  },
+  "phases": [
+    {
+      "id": "phase-1",
+      "name": "CLI Foundation",
+      "tasks": [
+        {
+          "id": "task-001",
+          "title": "Implement interactive shell + slash parser + /whoami",
+          "type": "backend_development",
+          "risk": "standard",
+          "deps": [],
+          "scope": {
+            "paths": ["packages/cli/**", "packages/shared/**"],
+            "exclude_paths": ["**/node_modules/**"],
+            "symbols": [],
+            "queries": ["slash command REPL", "config store", "api key auth"]
+          },
+          "acceptance": [
+            "trcoder shell starts",
+            "/help works",
+            "/whoami calls server and prints plan/credits",
+            "config saved locally"
+          ],
+          "execution": {
+            "lane": "balanced",
+            "budget_usd": { "min": 0.2, "max": 1.5 }
+          },
+          "outputs": {
+            "patch": "artifacts/patch_task-001.diff",
+            "docs": []
+          }
+        }
+      ]
+    }
+  ]
+}

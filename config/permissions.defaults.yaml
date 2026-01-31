@@ -1,0 +1,28 @@
+version: permissions.defaults.v1
+
+allow:
+  - "git status"
+  - "git diff"
+  - "git log*"
+  - "pnpm -w test*"
+  - "pnpm -w typecheck*"
+  - "pnpm -w lint*"
+  - "pnpm -w build*"
+  - "node --version"
+  - "pnpm --version"
+
+ask:
+  - "pnpm -w install*"
+  - "docker compose*"
+  - "kubectl*"
+  - "psql*"
+  - "mysql*"
+  - "curl*"
+  - "wget*"
+
+deny:
+  - "rm -rf *"
+  - "mkfs*"
+  - "dd if=*"
+  - "cat ~/.ssh/*"
+  - "powershell -enc*"

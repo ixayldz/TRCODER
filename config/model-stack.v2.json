@@ -1,0 +1,39 @@
+{
+  "version": "model-stack.v2",
+  "models": {
+    "gpt-5.2-xhigh": { "provider": "openai", "tier": "premium_reasoning" },
+    "claude-opus-4.5": { "provider": "anthropic", "tier": "premium" },
+    "claude-sonnet-4.5": { "provider": "anthropic", "tier": "standard" },
+    "gemini-3.0-pro": { "provider": "google", "tier": "standard" },
+    "deepseek-v3": { "provider": "deepseek", "tier": "economy" }
+  },
+  "task_type_map": {
+    "idea_validation": { "model": "gpt-5.2-xhigh", "reason": "strong reasoning, business analysis" },
+    "prd_creation": { "model": "gpt-5.2-xhigh", "reason": "product thinking" },
+    "architecture_design": { "model": "claude-opus-4.5", "reason": "system design tradeoffs" },
+    "project_planning": { "model": "claude-opus-4.5", "reason": "task breakdown mapping" },
+
+    "backend_development": { "model": "claude-sonnet-4.5", "reason": "code quality/speed balance" },
+    "frontend_development": { "model": "gemini-3.0-pro", "reason": "ui expertise and speed" },
+    "database_code": { "model": "gpt-5.2-xhigh", "reason": "query planning and optimization" },
+
+    "unit_tests": { "model": "gpt-5.2-xhigh", "reason": "edge cases + coverage" },
+    "integration_tests": { "model": "claude-sonnet-4.5", "reason": "complex scenarios" },
+
+    "quick_review": { "model": "gpt-5.2-xhigh", "reason": "fast comprehensive analysis" },
+    "deep_review": { "model": "gpt-5.2-xhigh", "reason": "architecture validation" },
+    "security_audit": { "model": "claude-opus-4.5", "reason": "careful security analysis" },
+
+    "code_refactoring": { "model": "claude-sonnet-4.5", "reason": "clean code patterns" },
+    "docker_kubernetes": { "model": "claude-sonnet-4.5", "reason": "infra as code" },
+    "ci_cd": { "model": "claude-opus-4.5", "reason": "enterprise pipelines" },
+
+    "technical_docs": { "model": "claude-opus-4.5", "reason": "long form docs" },
+    "api_docs": { "model": "claude-sonnet-4.5", "reason": "openapi + examples" }
+  },
+  "fallback_chains": {
+    "gpt-5.2-xhigh": ["claude-opus-4.5", "claude-sonnet-4.5"],
+    "claude-opus-4.5": ["gpt-5.2-xhigh", "claude-sonnet-4.5"],
+    "gemini-3.0-pro": ["claude-sonnet-4.5"]
+  }
+}
