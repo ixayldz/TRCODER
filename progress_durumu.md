@@ -4,8 +4,8 @@ Tarih: 2026-01-31
 Durum ozeti:
 - V1 spesifikasyon uyumu: %100 (dokumanlara gore zorunlu tum maddeler tamam)
 - V1 RC gate kapsami (lokal test+kod): %100
-- Uretime hazirlik seviyesi: %88-92 (CI kaniti, RC artifact seti ve prod entegrasyonlari eksik)
-- Uygulama toplam ilerleme: %95 (V1 tamam, RC sign-off icin kanit/artifact/CI eksik)
+- Uretime hazirlik seviyesi: %92-95 (CI kaniti ve prod entegrasyonlari eksik)
+- Uygulama toplam ilerleme: %96-97 (V1 tamam, RC sign-off icin CI kaniti eksik)
 
 ## 1) Kapsam ve Kaynaklar
 Referans spesifikasyonlari:
@@ -149,7 +149,8 @@ Son test kosumu:
 - pnpm pinned: packageManager=pnpm@9.12.1 (tamam)
 - node pinned: package.json engines + .nvmrc/.node-version (tamam)
 - Lokal kanit: node -v = v22.12.0, pnpm -v = 9.12.1 (Node versiyonu spec'teki 20.11.x ile uyumsuz; CI/RC kaniti gerekiyor)
-- RC runbook otomasyonu: scripts/rc-run.ps1 eklendi (Node 20.11.1 zip indirildi fakat runbook timeout nedeniyle artifact uretilemedi)
+- RC runbook otomasyonu: scripts/rc-run.ps1 duzeltildi, artifact seti uretildi (rc-20260201-015044)
+ - Node 20.11.1 kullanildi ve env.txt kaydedildi
 
 1) Spec Compliance Gate
 - Command catalog coverage testi: packages/cli/test/command-catalog.test.ts (PASS)
@@ -177,7 +178,8 @@ Son test kosumu:
 
 5) Cross-Platform Gate
 - Lokal testler Windows'ta PASS
-- macOS/Linux CI linkleri henüz yok (RC sign-off icin gerekli)
+- GitHub Actions CI eklendi (ubuntu/macos/windows, node 20.11.1, pnpm 9.12.1)
+ - Ilk CI calismasi ve linkler bekleniyor
 
 6) Security Notes
 - docs/security.md ve docs/providers.md eklendi (PR adapter + Postgres stub net)
@@ -196,9 +198,7 @@ Prod-grade icin eksikler (V1 disi):
 - Rate limiting / abuse protection
 
 RC sign-off icin eksikler:
-- Node 20.11.x ile kanitli calistirma (local veya CI)
-- Windows/macOS/Linux CI install+test linkleri
-- RC artifact seti (ledger.jsonl, sse.log, invoice-preview.json, ctx-redaction-report.md, apply-report.md, doctor.txt)
+- Windows/macOS/Linux CI install+test linkleri (workflow eklendi, ilk run bekleniyor)
 
 ## 5) Risk / Notlar
 - LF/CRLF uyarilari Windows kaynakli (kosmetik).
