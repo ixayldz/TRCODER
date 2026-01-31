@@ -167,15 +167,18 @@ export interface LedgerEvent {
 
 export type LedgerEventType =
   | "RUN_STARTED"
+  | "PLAN_STATUS"
   | "PLAN_CREATED"
   | "PLAN_APPROVED"
   | "TASK_STARTED"
+  | "TASK_STAGE"
   | "ROUTER_DECISION"
   | "CONTEXT_PACK_BUILT"
   | "LLM_CALL_STARTED"
   | "LLM_CALL_FINISHED"
   | "RUNNER_CMD_STARTED"
   | "RUNNER_CMD_FINISHED"
+  | "RUNNER_CMD_BLOCKED"
   | "VERIFY_STARTED"
   | "VERIFY_FINISHED"
   | "PATCH_PRODUCED"
@@ -183,7 +186,10 @@ export type LedgerEventType =
   | "RUN_COMPLETED"
   | "BILLING_POSTED"
   | "ANOMALY_DETECTED"
-  | "RUN_PAUSED";
+  | "RUN_PAUSED"
+  | "RUN_RESUMED"
+  | "RUN_CANCELLED"
+  | "RUNNER_AUTH_FAILED";
 
 export interface CostBreakdown {
   provider_cost_usd: number;

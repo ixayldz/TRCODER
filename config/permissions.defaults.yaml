@@ -1,8 +1,9 @@
 version: permissions.defaults.v1
 
 allow:
-  - "git status"
-  - "git diff"
+  - "git status*"
+  - "git diff*"
+  - "git rev-parse*"
   - "git log*"
   - "pnpm -w test*"
   - "pnpm -w typecheck*"

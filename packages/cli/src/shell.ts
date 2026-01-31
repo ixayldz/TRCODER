@@ -15,6 +15,7 @@ import {
   formatTaskHeader,
   formatTaskResult
 } from "./output";
+import { getHelpLines, HELP_MAP } from "./help";
 import { loadPermissionPolicy } from "./permissions";
 import { RunnerClient } from "./runner-client";
 import { parseSlashCommand } from "./parser";
@@ -165,7 +166,7 @@ export class Shell {
         this.cmdPermissions(tokens);
         break;
       case "doctor":
-        this.cmdDoctor();
+        await this.cmdDoctor();
         break;
       case "logs":
         await this.cmdLogs(tokens);
@@ -188,80 +189,12 @@ export class Shell {
   }
 
   private printHelp(command?: string): void {
-    const helpMap: Record<string, string> = {
-      help: "/help [command]",
-      whoami: "/whoami",
-      plan: "/plan [from @file] | /plan status | /plan diff | /plan approve",
-      start: "/start [--task <task_id>]",
-      run: "/run status | /run pause | /run resume | /run cancel",
-      tasks: "/tasks",
-      attach: "/attach <run_id>",
-      context: "/context show | /context expand|trim [--max-lines N --max-files N --depth N --topk N]",
-      pins: "/pins add @<file> | /pins rm @<file> | /pins list",
-      verify: "/verify [--target <path>]",
-      fix: "/fix",
-      diff: "/diff",
-      apply: "/apply",
-      usage: "/usage month | /usage today",
-      invoice: "/invoice preview",
-      cost: "/cost explain <task_id>",
-      lane: "/lane set speed|balanced|quality|cost-saver",
-      risk: "/risk set low|standard|high",
-      budget: "/budget cap <usd> | /budget status",
-      permissions: "/permissions [allow|ask|deny] \"<cmd>\"",
-      doctor: "/doctor",
-      logs: "/logs tail [--run <id>]",
-      project: "/project status",
-      pr: "/pr status",
-      init: "/init [--portable] [--refresh]",
-      next: "/next"
-    };
     if (command) {
-      const text = helpMap[command];
+      const text = HELP_MAP[command];
       console.log(text ?? `Unknown command: ${command}`);
       return;
     }
-    console.log(
-      [
-        "/help",
-        "/whoami",
-        "/plan [from @file]",
-        "/plan status",
-        "/plan diff",
-        "/plan approve",
-        "/start",
-        "/start --task <task_id>",
-        "/next",
-        "/run status",
-        "/run pause|resume|cancel",
-        "/tasks",
-        "/attach <run_id>",
-        "/context show",
-        "/context expand|trim",
-        "/context rebuild",
-        "/pins add|rm|list",
-        "/verify",
-        "/verify --target <path>",
-        "/fix",
-        "/diff",
-        "/apply",
-        "/usage month",
-        "/usage today",
-        "/invoice preview",
-        "/cost explain <task_id>",
-        "/lane set <speed|balanced|quality|cost-saver>",
-        "/risk set <low|standard|high>",
-        "/budget cap <usd>",
-        "/budget status",
-        "/permissions",
-        "/doctor",
-        "/logs tail",
-        "/export ledger",
-        "/project status",
-        "/pr status",
-        "/init"
-      ].join("\n")
-    );
+    console.log(getHelpLines().join("\n"));
   }
 
   private async cmdWhoami(): Promise<void> {
@@ -275,21 +208,7 @@ export class Shell {
     if (args[0] === "status") {
       const status = await this.api.get<any>(`/v1/projects/${this.config.project_id}/plan/status`);
       const localCommit = await this.getRepoCommit();
-      const approvedCommit = status.approved_repo_commit;
-      const stale = approvedCommit && approvedCommit !== localCommit;
-      console.log(
-        JSON.stringify(
-          {
-            latest_plan_id: status.latest_plan_id,
-            approved_plan_id: status.approved_plan_id,
-            approved_repo_commit: approvedCommit,
-            local_repo_commit: localCommit,
-            stale
-          },
-          null,
-          2
-        )
-      );
+      console.log(JSON.stringify({ ...status, local_repo_commit: localCommit }, null, 2));
       return;
     }
 
@@ -343,14 +262,19 @@ export class Shell {
 
   private async cmdStart(args: string[]): Promise<void> {
     const status = await this.api.get<any>(`/v1/projects/${this.config.project_id}/plan/status`);
-    const localCommit = await this.getRepoCommit();
-    if (status.approved_repo_commit && status.approved_repo_commit !== localCommit) {
-      console.log(`Plan stale. Approved commit: ${status.approved_repo_commit}, local: ${localCommit}`);
+    let confirmStale = false;
+    if (status.stale) {
+      const reason = status.stale_reason ?? "unknown";
+      const approved = status.approved_repo_commit ?? "n/a";
+      const current = status.current_repo_commit ?? "n/a";
+      const dirty = status.dirty === null || status.dirty === undefined ? "unknown" : status.dirty;
+      console.log(`Plan stale (${reason}). Approved: ${approved}, current: ${current}, dirty: ${dirty}`);
       const confirm = await this.promptExact("TYPE: START to override", "START");
       if (!confirm) {
         console.log("Start cancelled.");
         return;
       }
+      confirmStale = true;
     }
 
     const taskIndex = args.findIndex((arg) => arg === "--task");
@@ -374,8 +298,8 @@ export class Shell {
       reasons.push("high risk task type");
     }
     if (taskMeta?.scope?.paths && riskPolicy?.high_risk_path_patterns?.length) {
-      const matched = taskMeta.scope.paths.some((p) =>
-        riskPolicy.high_risk_path_patterns.some((pattern) => this.globMatch(pattern, p))
+      const matched = taskMeta.scope.paths.some((p: string) =>
+        riskPolicy.high_risk_path_patterns.some((pattern: string) => this.globMatch(pattern, p))
       );
       if (matched) {
         requiresConfirm = true;
@@ -400,7 +324,8 @@ export class Shell {
       budget_cap_usd: this.config.budget_cap_usd,
       context_budget: this.config.context_override,
       task_id: taskId,
-      confirm_high_risk: confirmHighRisk
+      confirm_high_risk: confirmHighRisk,
+      confirm_stale: confirmStale
     });
     const runId = res.run_id as string;
     this.config.last_run_id = runId;
@@ -495,6 +420,9 @@ export class Shell {
       console.log(`Verify: ${event.data.status} (${event.data.verify_report ?? "no report"})`);
     } else if (event.type === "ANOMALY") {
       console.log(formatAnomaly(event.data));
+    } else if (event.type === "PERMISSION_DENIED") {
+      const reason = event.data?.reason ? ` (${event.data.reason})` : "";
+      console.log(`Permission denied: ${event.data?.command ?? "command"}${reason}`);
     } else if (event.type === "SESSION_STATS") {
       console.log(formatSessionStats(event.data));
     }
@@ -815,15 +743,18 @@ export class Shell {
 
   private async cmdCost(args: string[]): Promise<void> {
     if (args[0] !== "explain") {
-      console.log("Usage: /cost explain <task_id>");
+      console.log("Usage: /cost explain <task_id|--run run_id>");
       return;
     }
-    const taskId = args[1] ?? this.config.last_task_id;
-    if (!taskId) {
-      console.log("No task id available.");
+    const runIdx = args.findIndex((arg) => arg === "--run");
+    const runId = runIdx !== -1 ? args[runIdx + 1] : undefined;
+    const taskId = runId ? undefined : args[1] ?? this.config.last_task_id;
+    if (!runId && !taskId) {
+      console.log("Usage: /cost explain <task_id|--run run_id>");
       return;
     }
-    const res = await this.api.get<any>(`/v1/cost/explain?task_id=${taskId}`);
+    const query = runId ? `run_id=${runId}` : `task_id=${taskId}`;
+    const res = await this.api.get<any>(`/v1/cost/explain?${query}`);
     console.log(JSON.stringify(res, null, 2));
   }
 
@@ -917,9 +848,23 @@ export class Shell {
     console.log("Usage: /pins add @<file> | /pins rm @<file> | /pins list");
   }
 
-  private cmdDoctor(): void {
+  private async cmdDoctor(): Promise<void> {
     console.log(`storage.method: ${this.config.storage?.method ?? "file"}`);
     console.log(`storage.encrypted: ${this.config.storage?.encrypted ?? false}`);
+    try {
+      await this.api.get<any>("/v1/whoami");
+      console.log("server.connectivity: ok");
+    } catch (err) {
+      console.log(`server.connectivity: error (${(err as Error).message})`);
+    }
+    const runnerStatus = this.runner.getStatus();
+    const runnerLine = runnerStatus.connected
+      ? `runner.ws: connected${runnerStatus.session_id ? ` (${runnerStatus.session_id})` : ""}`
+      : "runner.ws: disconnected";
+    console.log(runnerLine);
+    if (runnerStatus.last_error) {
+      console.log(`runner.ws.last_error: ${runnerStatus.last_error}`);
+    }
     const filePath = path.join(os.homedir(), ".trcoder", "cli.json");
     if (fs.existsSync(filePath)) {
       console.log(`config.path: ${filePath}`);
@@ -945,13 +890,21 @@ export class Shell {
     }
     const runIdx = args.findIndex((arg) => arg === "--run");
     const runId = runIdx !== -1 ? args[runIdx + 1] : this.config.last_run_id;
+    if (!runId) {
+      console.log("No run id available.");
+      return;
+    }
     const logs = await this.api.get<any>(`/v1/logs/tail?run_id=${runId ?? ""}`);
     console.log(JSON.stringify(logs, null, 2));
   }
 
   private async cmdProject(args: string[]): Promise<void> {
+    if (args[0] === "connect") {
+      console.log("Use: trcoder connect (outside shell) to connect a project.");
+      return;
+    }
     if (args[0] !== "status") {
-      console.log("Usage: /project status");
+      console.log("Usage: /project status | /project connect");
       return;
     }
     const status = await this.api.get<any>(`/v1/projects/${this.config.project_id}/plan/status`);

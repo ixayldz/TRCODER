@@ -10,9 +10,6 @@
     "resolveJsonModule": true,
     "skipLibCheck": true,
     "types": ["node"],
-    "baseUrl": ".",
-    "paths": {
-      "@trcoder/shared": ["packages/shared/src"]
-    }
+    "baseUrl": "."
   }
 }

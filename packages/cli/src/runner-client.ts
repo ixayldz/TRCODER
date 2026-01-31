@@ -1,4 +1,4 @@
-import { WebSocket } from "ws";
+import { WebSocket, RawData } from "ws";
 import { classifyCommand, PermissionClass, PermissionsConfig } from "@trcoder/shared";
 import { spawn } from "child_process";
 import fs from "fs";
@@ -153,9 +153,15 @@ export class RunnerClient {
   private socket?: WebSocket;
   private options: RunnerClientOptions;
   private sessionId?: string;
+  private connected = false;
+  private lastError?: string;
 
   constructor(options: RunnerClientOptions) {
     this.options = options;
+  }
+
+  getStatus(): { connected: boolean; session_id?: string; last_error?: string } {
+    return { connected: this.connected, session_id: this.sessionId, last_error: this.lastError };
   }
 
   connect(): void {
@@ -168,6 +174,7 @@ export class RunnerClient {
     });
 
     this.socket.on("open", () => {
+      this.connected = true;
       this.socket?.send(
         JSON.stringify({
           type: "HELLO",
@@ -178,7 +185,7 @@ export class RunnerClient {
       );
     });
 
-    this.socket.on("message", async (raw) => {
+    this.socket.on("message", async (raw: RawData) => {
       const message = JSON.parse(String(raw));
       if (message.type === "HELLO_ACK") {
         this.sessionId = message.runner_session_id;
@@ -332,8 +339,15 @@ export class RunnerClient {
       }
     });
 
-    this.socket.on("error", (err) => {
+    this.socket.on("error", (err: Error) => {
+      this.lastError = String(err);
+      this.connected = false;
       this.options.log?.(`runner ws error: ${err}`);
+    });
+
+    this.socket.on("close", () => {
+      this.connected = false;
+      this.sessionId = undefined;
     });
   }
 }

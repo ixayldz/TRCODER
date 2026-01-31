@@ -16,7 +16,8 @@ import {
   loadPermissions,
   loadPricing,
   loadRiskPolicy,
-  loadVerifyGates
+  loadVerifyGates,
+  validateAllConfig
 } from "@trcoder/shared";
 import { createDb } from "./db";
 import { writeArtifact, writePlanArtifact } from "./artifacts";
@@ -102,46 +103,91 @@ function globMatch(pattern: string, value: string): boolean {
   return regex.test(value);
 }
 
-export async function createServer(): Promise<{
+export async function createServer(options?: {
+  onRoute?: (route: { method: string | string[]; url: string }) => void;
+}): Promise<{
   app: FastifyInstance;
   db: Awaited<ReturnType<typeof createDb>>;
 }> {
   const repoRoot = findRepoRoot(process.cwd());
-  const modelStack = loadModelStack(path.join(repoRoot, "config", "model-stack.v2.json"));
-  const lanePolicy = loadLanePolicy(path.join(repoRoot, "config", "lane-policy.v1.yaml"));
-  const riskPolicy = loadRiskPolicy(path.join(repoRoot, "config", "risk-policy.v1.yaml"));
-  const pricing = loadPricing(path.join(repoRoot, "config", "pricing.v1.yaml"));
-  const permissions = loadPermissions(
-    path.join(repoRoot, "config", "permissions.defaults.yaml")
+  const configRoot = process.env.TRCODER_CONFIG_ROOT ?? repoRoot;
+  const modelStack = loadModelStack(
+    process.env.TRCODER_MODEL_STACK_PATH ?? path.join(configRoot, "config", "model-stack.v2.json")
   );
-  const verifyGates = loadVerifyGates(path.join(repoRoot, "config", "verify.gates.yaml"));
+  const lanePolicy = loadLanePolicy(
+    process.env.TRCODER_LANE_POLICY_PATH ?? path.join(configRoot, "config", "lane-policy.v1.yaml")
+  );
+  const riskPolicy = loadRiskPolicy(
+    process.env.TRCODER_RISK_POLICY_PATH ?? path.join(configRoot, "config", "risk-policy.v1.yaml")
+  );
+  const pricing = loadPricing(
+    process.env.TRCODER_PRICING_PATH ?? path.join(configRoot, "config", "pricing.v1.yaml")
+  );
+  const permissions = loadPermissions(
+    process.env.TRCODER_PERMISSIONS_PATH ??
+      path.join(configRoot, "config", "permissions.defaults.yaml")
+  );
+  const verifyGates = loadVerifyGates(
+    process.env.TRCODER_VERIFY_GATES_PATH ?? path.join(configRoot, "config", "verify.gates.yaml")
+  );
+
+  const configValidation = validateAllConfig({ modelStack, lanePolicy, riskPolicy });
+  if (!configValidation.ok) {
+    const details = configValidation.errors.map((err) => `- ${err}`).join("\n");
+    throw new Error(`Config validation failed:\n${details}`);
+  }
+  if (configValidation.warnings.length > 0) {
+    // eslint-disable-next-line no-console
+    console.warn(`Config warnings:\n${configValidation.warnings.map((w) => `- ${w}`).join("\n")}`);
+  }
 
   const dbPath = process.env.TRCODER_DB_PATH;
   const db = await createDb(dbPath);
   const app = Fastify({ logger: false });
+  if (options?.onRoute) {
+    app.addHook("onRoute", options.onRoute);
+  }
   const events = new RunEventHub();
   const modelProvider = new MockModelProvider();
-  const runnerBridge = new RunnerBridge(app.server, permissions, (req) => {
-    const auth = req.headers["authorization"];
-    const projectHeader = req.headers["x-trcoder-project"];
-    if (!auth || !auth.toString().startsWith("Bearer ")) {
-      return null;
+  const runnerBridge = new RunnerBridge(
+    app.server,
+    permissions,
+    (req) => {
+      const auth = req.headers["authorization"];
+      const projectHeader = req.headers["x-trcoder-project"];
+      if (!auth || !auth.toString().startsWith("Bearer ")) {
+        return null;
+      }
+      const api_key = auth.toString().slice("Bearer ".length);
+      const record = db.query<{ org_id: string; user_id: string }>(
+        "SELECT org_id, user_id FROM api_keys WHERE key = ?",
+        [api_key]
+      )[0];
+      if (!record || !projectHeader) {
+        return null;
+      }
+      const project_id = projectHeader.toString();
+      const project = db.query("SELECT id FROM projects WHERE id = ?", [project_id])[0];
+      if (!project) {
+        return null;
+      }
+      return { project_id, org_id: record.org_id, user_id: record.user_id };
+    },
+    (req, reason) => {
+      const projectHeader = req.headers["x-trcoder-project"];
+      const project_id = projectHeader ? projectHeader.toString() : "unknown";
+      appendLedgerEvent(
+        db,
+        createLedgerEvent({
+          org_id: "unknown",
+          user_id: "unknown",
+          project_id,
+          event_type: "RUNNER_AUTH_FAILED",
+          payload: { reason }
+        })
+      );
     }
-    const api_key = auth.toString().slice("Bearer ".length);
-    const record = db.query<{ org_id: string; user_id: string }>(
-      "SELECT org_id, user_id FROM api_keys WHERE key = ?",
-      [api_key]
-    )[0];
-    if (!record || !projectHeader) {
-      return null;
-    }
-    const project_id = projectHeader.toString();
-    const project = db.query("SELECT id FROM projects WHERE id = ?", [project_id])[0];
-    if (!project) {
-      return null;
-    }
-    return { project_id, org_id: record.org_id, user_id: record.user_id };
-  });
+  );
 
   async function enrichContextPack(
     pack: ContextPackManifest,
@@ -233,6 +279,99 @@ export async function createServer(): Promise<{
     };
   }
 
+  type RepoState = {
+    current_commit: string | null;
+    dirty: boolean;
+    available: boolean;
+    error?: string;
+  };
+
+  async function getRepoState(projectId: string): Promise<RepoState> {
+    if (!runnerBridge.hasRunner(projectId)) {
+      return { current_commit: null, dirty: false, available: false, error: "runner_not_connected" };
+    }
+    let current_commit: string | null = null;
+    let dirty = false;
+    try {
+      const commitResult = await runnerBridge.sendExec({
+        project_id: projectId,
+        cmd: "git rev-parse HEAD",
+        cwd: repoRoot
+      });
+      if (commitResult.exit_code === 0) {
+        current_commit = (commitResult.stdout ?? "").trim() || null;
+      }
+      const statusResult = await runnerBridge.sendExec({
+        project_id: projectId,
+        cmd: "git status --porcelain",
+        cwd: repoRoot
+      });
+      if (statusResult.exit_code === 0) {
+        dirty = Boolean((statusResult.stdout ?? "").trim());
+      }
+    } catch (err) {
+      return {
+        current_commit,
+        dirty,
+        available: false,
+        error: (err as Error).message
+      };
+    }
+    return { current_commit, dirty, available: true };
+  }
+
+  function computeStale(approvedCommit: string | null | undefined, repoState: RepoState) {
+    if (!approvedCommit) {
+      return { stale: false, reason: null as string | null };
+    }
+    if (!repoState.available || !repoState.current_commit) {
+      return { stale: true, reason: repoState.error ?? "repo_state_unavailable" };
+    }
+    if (repoState.dirty) {
+      return { stale: true, reason: "working_tree_dirty" };
+    }
+    if (repoState.current_commit !== approvedCommit) {
+      return { stale: true, reason: "commit_mismatch" };
+    }
+    return { stale: false, reason: null as string | null };
+  }
+
+  function emitTaskStage(input: {
+    run_id: string;
+    task_id: string;
+    stage: string;
+    message: string;
+    org_id: string;
+    user_id: string;
+    project_id: string;
+    plan_id: string;
+  }) {
+    events.emit(input.run_id, {
+      type: "TASK_STAGE",
+      ts: new Date().toISOString(),
+      data: {
+        run_id: input.run_id,
+        task_id: input.task_id,
+        stage: input.stage,
+        message: input.message
+      }
+    });
+
+    appendLedgerEvent(
+      db,
+      createLedgerEvent({
+        org_id: input.org_id,
+        user_id: input.user_id,
+        project_id: input.project_id,
+        run_id: input.run_id,
+        plan_id: input.plan_id,
+        task_id: input.task_id,
+        event_type: "TASK_STAGE",
+        payload: { stage: input.stage, message: input.message }
+      })
+    );
+  }
+
   function requireAuth(req: FastifyRequest, reply: FastifyReply): AuthContext | null {
     const auth = req.headers["authorization"];
     if (!auth || !auth.toString().startsWith("Bearer ")) {
@@ -252,8 +391,6 @@ export async function createServer(): Promise<{
     }
     return { api_key, org_id: record.org_id, user_id: record.user_id, plan_id: record.plan_id };
   }
-
-  app.get("/health", async () => ({ ok: true }));
 
   app.post("/v1/projects/connect", async (req, reply) => {
     const auth = requireAuth(req, reply);
@@ -375,12 +512,38 @@ export async function createServer(): Promise<{
       [project_id]
     )[0];
 
+    const repoState = await getRepoState(project_id);
+    const staleInfo = computeStale(approved?.repo_commit, repoState);
+
+    appendLedgerEvent(
+      db,
+      createLedgerEvent({
+        org_id: auth.org_id,
+        user_id: auth.user_id,
+        project_id,
+        plan_id: approved?.id ?? latest?.id ?? null,
+        event_type: "PLAN_STATUS",
+        payload: {
+          latest_plan_id: latest?.id ?? null,
+          approved_plan_id: approved?.id ?? null,
+          approved_repo_commit: approved?.repo_commit ?? null,
+          current_repo_commit: repoState.current_commit,
+          dirty: repoState.available ? repoState.dirty : null,
+          stale: staleInfo.stale,
+          stale_reason: staleInfo.reason
+        }
+      })
+    );
+
     reply.send({
       latest_plan_id: latest?.id ?? null,
       approved_plan_id: approved?.id ?? null,
       latest_repo_commit: latest?.repo_commit ?? null,
       approved_repo_commit: approved?.repo_commit ?? null,
-      stale: false
+      current_repo_commit: repoState.current_commit,
+      dirty: repoState.available ? repoState.dirty : null,
+      stale: staleInfo.stale,
+      stale_reason: staleInfo.reason
     });
   });
 
@@ -395,6 +558,8 @@ export async function createServer(): Promise<{
       budget_cap_usd?: number;
       task_id?: string;
       confirm_high_risk?: boolean;
+      confirm_stale?: boolean;
+      model?: string;
       context_budget?: {
         max_files: number;
         max_lines: number;
@@ -404,14 +569,33 @@ export async function createServer(): Promise<{
       };
     };
 
-    const planRow = db.query<{ id: string; tasks_json: string; input_json: string }>(
-      "SELECT id, tasks_json, input_json FROM plans WHERE project_id = ? AND approved_at IS NOT NULL ORDER BY approved_at DESC LIMIT 1",
+    if (body.model) {
+      reply.code(400).send({ error: "model_override_not_allowed" });
+      return;
+    }
+
+    const planRow = db.query<{ id: string; tasks_json: string; input_json: string; repo_commit?: string }>(
+      "SELECT id, tasks_json, input_json, repo_commit FROM plans WHERE project_id = ? AND approved_at IS NOT NULL ORDER BY approved_at DESC LIMIT 1",
       [project_id]
     )[0];
 
     const plan_id = body.plan_id ?? planRow?.id;
     if (!plan_id || !planRow) {
       reply.code(400).send({ error: "no approved plan" });
+      return;
+    }
+
+    const repoState = await getRepoState(project_id);
+    const staleInfo = computeStale(planRow.repo_commit, repoState);
+    if (staleInfo.stale && !body.confirm_stale) {
+      reply.code(409).send({
+        error: "plan_stale",
+        stale: true,
+        stale_reason: staleInfo.reason,
+        current_repo_commit: repoState.current_commit,
+        approved_repo_commit: planRow.repo_commit ?? null,
+        dirty: repoState.available ? repoState.dirty : null
+      });
       return;
     }
 
@@ -518,10 +702,15 @@ export async function createServer(): Promise<{
     });
     appendLedgerEvent(db, runEvent);
 
-    events.emit(run_id, {
-      type: "TASK_STAGE",
-      ts: new Date().toISOString(),
-      data: { run_id, task_id: firstTask.id, stage: "PREPARE_CONTEXT", message: "Building context pack" }
+    emitTaskStage({
+      run_id,
+      task_id: firstTask.id,
+      stage: "PREPARE_CONTEXT",
+      message: "Building context pack",
+      org_id: auth.org_id,
+      user_id: auth.user_id,
+      project_id,
+      plan_id
     });
 
     const inputMeta = JSON.parse(planRow.input_json ?? "{}");
@@ -699,10 +888,15 @@ export async function createServer(): Promise<{
       return;
     }
 
-    events.emit(run_id, {
-      type: "TASK_STAGE",
-      ts: new Date().toISOString(),
-      data: { run_id, task_id: firstTask.id, stage: "DESIGN", message: "Preparing patch plan" }
+    emitTaskStage({
+      run_id,
+      task_id: firstTask.id,
+      stage: "DESIGN",
+      message: "Preparing patch plan",
+      org_id: auth.org_id,
+      user_id: auth.user_id,
+      project_id,
+      plan_id
     });
 
     const tokensEstimate = estimateTokens(firstTask.type, lane, risk);
@@ -788,10 +982,15 @@ export async function createServer(): Promise<{
     });
     appendLedgerEvent(db, patchEvent);
 
-    events.emit(run_id, {
-      type: "TASK_STAGE",
-      ts: new Date().toISOString(),
-      data: { run_id, task_id: firstTask.id, stage: "IMPLEMENT_PATCH", message: "Patch generated" }
+    emitTaskStage({
+      run_id,
+      task_id: firstTask.id,
+      stage: "IMPLEMENT_PATCH",
+      message: "Patch generated",
+      org_id: auth.org_id,
+      user_id: auth.user_id,
+      project_id,
+      plan_id
     });
 
     events.emit(run_id, {
@@ -815,16 +1014,26 @@ export async function createServer(): Promise<{
       }
     });
 
-    events.emit(run_id, {
-      type: "TASK_STAGE",
-      ts: new Date().toISOString(),
-      data: { run_id, task_id: firstTask.id, stage: "SELF_REVIEW", message: "Reviewing patch" }
+    emitTaskStage({
+      run_id,
+      task_id: firstTask.id,
+      stage: "SELF_REVIEW",
+      message: "Reviewing patch",
+      org_id: auth.org_id,
+      user_id: auth.user_id,
+      project_id,
+      plan_id
     });
 
-    events.emit(run_id, {
-      type: "TASK_STAGE",
-      ts: new Date().toISOString(),
-      data: { run_id, task_id: firstTask.id, stage: "PROPOSE_APPLY", message: "Ready for /diff and /apply" }
+    emitTaskStage({
+      run_id,
+      task_id: firstTask.id,
+      stage: "PROPOSE_APPLY",
+      message: "Ready for /diff and /apply",
+      org_id: auth.org_id,
+      user_id: auth.user_id,
+      project_id,
+      plan_id
     });
 
     const taskCompleted = createLedgerEvent({
@@ -942,6 +1151,23 @@ export async function createServer(): Promise<{
     if (!auth) return;
     const run_id = (req.params as { run_id: string }).run_id;
     db.exec("UPDATE runs SET state = ? WHERE id = ?", ["RUNNING", run_id]);
+    const run = db.query<Record<string, unknown>>("SELECT project_id, plan_id FROM runs WHERE id = ?", [run_id])[0] as
+      | { project_id: string; plan_id: string }
+      | undefined;
+    if (run) {
+      appendLedgerEvent(
+        db,
+        createLedgerEvent({
+          org_id: auth.org_id,
+          user_id: auth.user_id,
+          project_id: run.project_id,
+          run_id,
+          plan_id: run.plan_id,
+          event_type: "RUN_RESUMED",
+          payload: { reason: "manual" }
+        })
+      );
+    }
     reply.send({ ok: true });
   });
 
@@ -950,6 +1176,23 @@ export async function createServer(): Promise<{
     if (!auth) return;
     const run_id = (req.params as { run_id: string }).run_id;
     db.exec("UPDATE runs SET state = ? WHERE id = ?", ["CANCELLED", run_id]);
+    const run = db.query<Record<string, unknown>>("SELECT project_id, plan_id FROM runs WHERE id = ?", [run_id])[0] as
+      | { project_id: string; plan_id: string }
+      | undefined;
+    if (run) {
+      appendLedgerEvent(
+        db,
+        createLedgerEvent({
+          org_id: auth.org_id,
+          user_id: auth.user_id,
+          project_id: run.project_id,
+          run_id,
+          plan_id: run.plan_id,
+          event_type: "RUN_CANCELLED",
+          payload: { reason: "manual" }
+        })
+      );
+    }
     reply.send({ ok: true });
   });
 
@@ -984,15 +1227,15 @@ export async function createServer(): Promise<{
       riskPolicy.risk_levels[run.risk as RiskLevel].verify_strictness
     );
 
-    events.emit(run_id, {
-      type: "TASK_STAGE",
-      ts: new Date().toISOString(),
-      data: {
-        run_id,
-        task_id: run.current_task_id,
-        stage: "LOCAL_VERIFY",
-        message: `verify mode: ${verifyMode}`
-      }
+    emitTaskStage({
+      run_id,
+      task_id: run.current_task_id,
+      stage: "LOCAL_VERIFY",
+      message: `verify mode: ${verifyMode}`,
+      org_id: auth.org_id,
+      user_id: auth.user_id,
+      project_id: run.project_id,
+      plan_id: run.plan_id
     });
 
     const verifyStart = createLedgerEvent({
@@ -1024,6 +1267,38 @@ export async function createServer(): Promise<{
 
       const result = await runnerBridge.sendExec({ project_id: run.project_id, cmd: command });
       results.push({ gate, exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr });
+
+      const stderr = result.stderr ?? "";
+      if (
+        result.exit_code !== 0 &&
+        (stderr.includes("Denied by permissions") || stderr.includes("User denied command"))
+      ) {
+        const reason = stderr.includes("User denied") ? "ask_denied" : "deny";
+        appendLedgerEvent(
+          db,
+          createLedgerEvent({
+            org_id: auth.org_id,
+            user_id: auth.user_id,
+            project_id: run.project_id,
+            run_id,
+            plan_id: run.plan_id,
+            task_id: run.current_task_id,
+            event_type: "RUNNER_CMD_BLOCKED",
+            payload: { command, gate, reason }
+          })
+        );
+        events.emit(run_id, {
+          type: "PERMISSION_DENIED",
+          ts: new Date().toISOString(),
+          data: {
+            run_id,
+            task_id: run.current_task_id,
+            command,
+            gate,
+            reason
+          }
+        });
+      }
 
       const cmdFinish = createLedgerEvent({
         org_id: auth.org_id,
@@ -1159,10 +1434,14 @@ export async function createServer(): Promise<{
     const auth = requireAuth(req, reply);
     if (!auth) return;
     const query = req.query as { run_id?: string; limit?: string };
-    const limit = Number(query.limit ?? 50);
-    const rows = db.query(
+    if (!query.run_id) {
+      reply.code(400).send({ error: "run_id required" });
+      return;
+    }
+    const limit = clampInt(Number(query.limit ?? 50), 1, 500);
+    const rows = db.query<{ event_id: string; ts: string; event_type: string; payload_json?: string }>(
       "SELECT event_id, ts, event_type, payload_json FROM ledger_events WHERE run_id = ? ORDER BY ts DESC LIMIT ?",
-      [query.run_id ?? "", limit]
+      [query.run_id, limit]
     );
     reply.send({
       run_id: query.run_id,
@@ -1178,7 +1457,18 @@ export async function createServer(): Promise<{
   app.get("/v1/ledger/export", async (req, reply) => {
     const auth = requireAuth(req, reply);
     if (!auth) return;
-    const rows = db.query(
+    const rows = db.query<{
+      event_id: string;
+      ts: string;
+      org_id: string;
+      user_id: string;
+      project_id: string;
+      run_id?: string;
+      plan_id?: string;
+      task_id?: string;
+      event_type: string;
+      payload_json?: string;
+    }>(
       "SELECT event_id, ts, org_id, user_id, project_id, run_id, plan_id, task_id, event_type, payload_json FROM ledger_events ORDER BY ts ASC"
     );
     const jsonl = rows

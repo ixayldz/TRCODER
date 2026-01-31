@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { IncomingMessage } from "http";
+import { IncomingMessage, Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { classifyCommand, PermissionClass, PermissionsConfig } from "@trcoder/shared";
 
@@ -26,6 +26,7 @@ export class RunnerBridge {
   private wss: WebSocketServer;
   private connections = new Map<string, RunnerConnection>();
   private permissions: PermissionsConfig;
+  private onAuthFailed?: (req: IncomingMessage, reason: string) => void;
   private authorize: (req: IncomingMessage) => {
     project_id: string;
     org_id: string;
@@ -33,17 +34,20 @@ export class RunnerBridge {
   } | null;
 
   constructor(
-    server: unknown,
+    server: Server,
     permissions: PermissionsConfig,
-    authorize: (req: IncomingMessage) => { project_id: string; org_id: string; user_id: string } | null
+    authorize: (req: IncomingMessage) => { project_id: string; org_id: string; user_id: string } | null,
+    onAuthFailed?: (req: IncomingMessage, reason: string) => void
   ) {
     this.permissions = permissions;
     this.authorize = authorize;
+    this.onAuthFailed = onAuthFailed;
     this.wss = new WebSocketServer({ server, path: "/v1/runner/ws" });
 
     this.wss.on("connection", (socket, req) => {
       const auth = this.authorize(req);
       if (!auth) {
+        this.onAuthFailed?.(req, "unauthorized");
         socket.close();
         return;
       }
@@ -55,6 +59,7 @@ export class RunnerBridge {
           const message = JSON.parse(String(raw));
           if (message.type === "HELLO") {
             if (message.project_id !== auth.project_id) {
+              this.onAuthFailed?.(req, "project_mismatch");
               socket.close();
               return;
             }

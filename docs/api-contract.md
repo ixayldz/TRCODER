@@ -5,6 +5,10 @@
 
 ## REST Endpoints
 
+### Identity
+- GET /v1/whoami
+  res: { org_id, user_id, plan_id, credits_included, credits_used, payg_overage }
+
 ### Project
 - POST /v1/projects/connect
   req: { repo_name, repo_root_hash }
@@ -20,14 +24,23 @@
   res: { ok: true }
 
 - GET /v1/projects/:id/plan/status
-  res: { latest_plan_id, approved_plan_id, stale?, latest_repo_commit?, approved_repo_commit? }
+  res: {
+    latest_plan_id,
+    approved_plan_id,
+    stale?,
+    stale_reason?,
+    latest_repo_commit?,
+    approved_repo_commit?,
+    current_repo_commit?,
+    dirty?
+  }
 
 - GET /v1/projects/:id/plan/tasks
   res: tasks.v1 json
 
 ### Runs
 - POST /v1/projects/:id/runs/start
-  req: { plan_id?, lane?, risk?, budget_cap_usd?, task_id?, confirm_high_risk?, context_budget? }
+  req: { plan_id?, lane?, risk?, budget_cap_usd?, task_id?, confirm_high_risk?, confirm_stale?, context_budget? }
   res: { run_id }
 
 - GET /v1/runs/:run_id/status
@@ -40,7 +53,9 @@
   req: { mode?, target? }
   res: { status, report_path, gates }
 
-- POST /v1/runs/:run_id/pause|resume|cancel
+- POST /v1/runs/:run_id/pause
+- POST /v1/runs/:run_id/resume
+- POST /v1/runs/:run_id/cancel
 
 ### Streaming
 - GET /v1/runs/:run_id/stream (SSE)

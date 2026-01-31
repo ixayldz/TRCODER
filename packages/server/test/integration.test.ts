@@ -101,13 +101,22 @@ describe("integration smoke", () => {
         sessionId = msg.runner_session_id;
       }
       if (msg.type === "RUNNER_EXEC") {
+        const cmd = String(msg.cmd ?? "");
+        let stdout = "ok";
+        if (cmd.startsWith("git rev-parse")) {
+          stdout = "DEV";
+        } else if (cmd.startsWith("git status --porcelain")) {
+          stdout = "";
+        } else if (cmd.startsWith("git diff --stat")) {
+          stdout = "";
+        }
         ws.send(
           JSON.stringify({
             type: "RUNNER_RESULT",
             request_id: msg.request_id,
             runner_session_id: sessionId,
             exit_code: 0,
-            stdout: "ok",
+            stdout,
             stderr: "",
             duration_ms: 1
           })
