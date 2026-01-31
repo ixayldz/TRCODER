@@ -151,7 +151,7 @@ Son test kosumu:
 - Lokal kanit: node -v = v22.12.0, pnpm -v = 9.12.1 (Node versiyonu spec'teki 20.11.x ile uyumsuz; CI/RC kaniti gerekiyor)
 - RC runbook otomasyonu: scripts/rc-run.ps1 duzeltildi, artifact seti uretildi (rc-20260201-015044)
  - Node 20.11.1 kullanildi ve env.txt kaydedildi
- - GitHub Actions CI (node 20.11.1): https://github.com/ixayldz/TRCODER/actions/runs/21552615729
+- GitHub Actions CI (node 20.11.1): https://github.com/ixayldz/TRCODER/actions/runs/21552640249
 
 1) Spec Compliance Gate
 - Command catalog coverage testi: packages/cli/test/command-catalog.test.ts (PASS)
@@ -180,9 +180,9 @@ Son test kosumu:
 5) Cross-Platform Gate
 - Lokal testler Windows'ta PASS
 - GitHub Actions CI eklendi (ubuntu/macos/windows, node 20.11.1, pnpm 9.12.1)
- - Linux: https://github.com/ixayldz/TRCODER/actions/runs/21552615729/job/62103639157 (PASS)
- - macOS: https://github.com/ixayldz/TRCODER/actions/runs/21552615729/job/62103639153 (PASS)
- - Windows: https://github.com/ixayldz/TRCODER/actions/runs/21552615729/job/62103639156 (PASS)
+- Linux: https://github.com/ixayldz/TRCODER/actions/runs/21552640249/job/62103697066 (PASS)
+- macOS: https://github.com/ixayldz/TRCODER/actions/runs/21552640249/job/62103697072 (PASS)
+- Windows: https://github.com/ixayldz/TRCODER/actions/runs/21552640249/job/62103697082 (PASS)
 
 6) Security Notes
 - docs/security.md ve docs/providers.md eklendi (PR adapter + Postgres stub net)
