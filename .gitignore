@@ -35,6 +35,9 @@ temp/
 *.tmp
 
 # Local runtime/state
+.claude/
+.trcoder/
+artifacts/
 .trcoder/db.sqlite
 .trcoder/*.sqlite
 .trcoder/*.sqlite-journal
