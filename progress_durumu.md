@@ -4,8 +4,8 @@ Tarih: 2026-01-31
 Durum ozeti:
 - V1 spesifikasyon uyumu: %100 (dokumanlara gore zorunlu tum maddeler tamam)
 - V1 RC gate kapsami (lokal test+kod): %100
-- Uretime hazirlik seviyesi: %92-95 (CI kaniti ve prod entegrasyonlari eksik)
-- Uygulama toplam ilerleme: %96-97 (V1 tamam, RC sign-off icin CI kaniti eksik)
+- Uretime hazirlik seviyesi: %94-96 (prod entegrasyonlari eksik)
+- Uygulama toplam ilerleme: %98-99 (V1 + RC kanitlari tamam, prod-grade eksikler kaldı)
 
 ## 1) Kapsam ve Kaynaklar
 Referans spesifikasyonlari:
@@ -151,6 +151,7 @@ Son test kosumu:
 - Lokal kanit: node -v = v22.12.0, pnpm -v = 9.12.1 (Node versiyonu spec'teki 20.11.x ile uyumsuz; CI/RC kaniti gerekiyor)
 - RC runbook otomasyonu: scripts/rc-run.ps1 duzeltildi, artifact seti uretildi (rc-20260201-015044)
  - Node 20.11.1 kullanildi ve env.txt kaydedildi
+ - GitHub Actions CI (node 20.11.1): https://github.com/ixayldz/TRCODER/actions/runs/21552615729
 
 1) Spec Compliance Gate
 - Command catalog coverage testi: packages/cli/test/command-catalog.test.ts (PASS)
@@ -179,7 +180,9 @@ Son test kosumu:
 5) Cross-Platform Gate
 - Lokal testler Windows'ta PASS
 - GitHub Actions CI eklendi (ubuntu/macos/windows, node 20.11.1, pnpm 9.12.1)
- - Ilk CI calismasi ve linkler bekleniyor
+ - Linux: https://github.com/ixayldz/TRCODER/actions/runs/21552615729/job/62103639157 (PASS)
+ - macOS: https://github.com/ixayldz/TRCODER/actions/runs/21552615729/job/62103639153 (PASS)
+ - Windows: https://github.com/ixayldz/TRCODER/actions/runs/21552615729/job/62103639156 (PASS)
 
 6) Security Notes
 - docs/security.md ve docs/providers.md eklendi (PR adapter + Postgres stub net)
@@ -198,7 +201,7 @@ Prod-grade icin eksikler (V1 disi):
 - Rate limiting / abuse protection
 
 RC sign-off icin eksikler:
-- Windows/macOS/Linux CI install+test linkleri (workflow eklendi, ilk run bekleniyor)
+- Yok (RC kanitlari ve CI linkleri tamam)
 
 ## 5) Risk / Notlar
 - LF/CRLF uyarilari Windows kaynakli (kosmetik).
