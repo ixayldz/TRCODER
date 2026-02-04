@@ -155,6 +155,8 @@ export class RunnerClient {
   private sessionId?: string;
   private connected = false;
   private lastError?: string;
+  private reconnectTimer?: NodeJS.Timeout;
+  private reconnectAttempts = 0;
 
   constructor(options: RunnerClientOptions) {
     this.options = options;
@@ -164,18 +166,57 @@ export class RunnerClient {
     return { connected: this.connected, session_id: this.sessionId, last_error: this.lastError };
   }
 
+  setProjectId(projectId: string): void {
+    this.options.projectId = projectId;
+    this.sessionId = undefined;
+    this.connected = false;
+    this.lastError = undefined;
+    this.connect();
+  }
+
   connect(): void {
+    // Idempotent-ish connect: replace any existing connection and start a reconnect loop on failure.
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+    const existing = this.socket;
+    // Mark the old socket as stale before closing so its events are ignored.
+    this.socket = undefined;
+    try {
+      existing?.close();
+    } catch {
+      // ignore
+    }
+    this.openSocket();
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer) return;
+    if (!this.options.projectId) return;
+    const delay = Math.min(10000, 1000 + this.reconnectAttempts * 1000);
+    this.reconnectAttempts += 1;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = undefined;
+      this.openSocket();
+    }, delay);
+  }
+
+  private openSocket(): void {
     const wsUrl = this.options.serverUrl.replace("http", "ws") + "/v1/runner/ws";
-    this.socket = new WebSocket(wsUrl, {
+    const socket = new WebSocket(wsUrl, {
       headers: {
         Authorization: `Bearer ${this.options.apiKey}`,
         "X-TRCODER-Project": this.options.projectId
       }
     });
+    this.socket = socket;
 
-    this.socket.on("open", () => {
+    socket.on("open", () => {
+      if (socket !== this.socket) return;
       this.connected = true;
-      this.socket?.send(
+      this.reconnectAttempts = 0;
+      socket.send(
         JSON.stringify({
           type: "HELLO",
           project_id: this.options.projectId,
@@ -185,7 +226,8 @@ export class RunnerClient {
       );
     });
 
-    this.socket.on("message", async (raw: RawData) => {
+    socket.on("message", async (raw: RawData) => {
+      if (socket !== this.socket) return;
       const message = JSON.parse(String(raw));
       if (message.type === "HELLO_ACK") {
         this.sessionId = message.runner_session_id;
@@ -241,6 +283,65 @@ export class RunnerClient {
             ...result
           })
         );
+        return;
+      }
+
+      if (message.type === "RUNNER_WRITE") {
+        const targetPath = String(message.path ?? "");
+        const encoding = String(message.encoding ?? "utf8");
+        const content = String(message.content ?? "");
+
+        const allowed = this.options.confirm
+          ? await this.options.confirm(`Allow file write? ${targetPath}`)
+          : false;
+
+        if (!allowed) {
+          this.socket?.send(
+            JSON.stringify({
+              type: "RUNNER_RESULT",
+              request_id: message.request_id,
+              runner_session_id: this.sessionId,
+              exit_code: 1,
+              stdout: "",
+              stderr: "User denied file write",
+              duration_ms: 0
+            })
+          );
+          return;
+        }
+
+        try {
+          const dir = path.dirname(targetPath);
+          fs.mkdirSync(dir, { recursive: true });
+          if (encoding === "base64") {
+            fs.writeFileSync(targetPath, Buffer.from(content, "base64"));
+          } else {
+            fs.writeFileSync(targetPath, content, "utf8");
+          }
+          this.socket?.send(
+            JSON.stringify({
+              type: "RUNNER_RESULT",
+              request_id: message.request_id,
+              runner_session_id: this.sessionId,
+              exit_code: 0,
+              stdout: "ok",
+              stderr: "",
+              duration_ms: 1
+            })
+          );
+        } catch (err) {
+          this.socket?.send(
+            JSON.stringify({
+              type: "RUNNER_RESULT",
+              request_id: message.request_id,
+              runner_session_id: this.sessionId,
+              exit_code: 1,
+              stdout: "",
+              stderr: (err as Error).message,
+              duration_ms: 1
+            })
+          );
+        }
         return;
       }
 
@@ -339,15 +440,31 @@ export class RunnerClient {
       }
     });
 
-    this.socket.on("error", (err: Error) => {
+    socket.on("error", (err: Error) => {
+      if (socket !== this.socket) return;
       this.lastError = String(err);
       this.connected = false;
       this.options.log?.(`runner ws error: ${err}`);
+      this.scheduleReconnect();
     });
 
-    this.socket.on("close", () => {
+    socket.on("unexpected-response", (_req, res) => {
+      if (socket !== this.socket) return;
+      const status = (res as any)?.statusCode ?? "unknown";
+      this.lastError = `unexpected response: ${status}`;
+      this.connected = false;
+      this.options.log?.(`runner ws error: unexpected response ${status}`);
+    });
+
+    socket.on("close", (code, reason) => {
+      if (socket !== this.socket) return;
       this.connected = false;
       this.sessionId = undefined;
+      const reasonText = reason ? reason.toString() : "";
+      if (!this.lastError && code && code !== 1000) {
+        this.lastError = `closed: code=${code} reason=${reasonText}`;
+      }
+      this.scheduleReconnect();
     });
   }
 }

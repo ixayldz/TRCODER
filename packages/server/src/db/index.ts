@@ -1,18 +1,29 @@
 import fs from "fs";
 import path from "path";
 import initSqlJs, { Database } from "sql.js";
+import { createPgDb } from "./pg-db";
 
+export type DbDriver = "sqljs" | "postgres";
+
+// Async database interface (used for both sql.js and postgres)
 export interface IDb {
-  migrate(): void;
-  close(): void;
-  exec(sql: string, params?: unknown[]): void;
-  query<T = Record<string, unknown>>(sql: string, params?: unknown[]): T[];
-  transaction<T>(fn: () => T): T;
+  migrate(): Promise<void>;
+  close(): Promise<void>;
+  exec(sql: string, params?: unknown[]): Promise<void>;
+  query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>;
+  transaction<T>(fn: () => Promise<T>): Promise<T>;
+  healthCheck?(): Promise<{ healthy: boolean; latencyMs: number }>;
 }
+
+export type IDbAsync = IDb;
 
 export class SqlJsDb implements IDb {
   private db: Database;
   private persistPath?: string;
+  private persistTimer?: NodeJS.Timeout;
+  private persistInFlight: Promise<void> | null = null;
+  private inTransactionDepth = 0;
+  private persistPendingAfterTx = false;
 
   private constructor(db: Database, persistPath?: string) {
     this.db = db;
@@ -34,8 +45,46 @@ export class SqlJsDb implements IDb {
     return new SqlJsDb(db, persistPath);
   }
 
-  migrate(): void {
-    this.exec(`
+  private schedulePersist(): void {
+    if (!this.persistPath) return;
+    if (this.inTransactionDepth > 0) {
+      this.persistPendingAfterTx = true;
+      return;
+    }
+    if (this.persistTimer) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = undefined;
+      void this.persistNow();
+    }, 150);
+  }
+
+  private async persistNow(): Promise<void> {
+    if (!this.persistPath) return;
+    if (this.inTransactionDepth > 0) {
+      this.persistPendingAfterTx = true;
+      return;
+    }
+
+    const doPersist = async () => {
+      const data = this.db.export();
+      fs.mkdirSync(path.dirname(this.persistPath!), { recursive: true });
+      fs.writeFileSync(this.persistPath!, Buffer.from(data));
+    };
+
+    // Serialize exports; they are synchronous and can be expensive on larger DBs.
+    const prev = this.persistInFlight ?? Promise.resolve();
+    const next = prev.then(doPersist);
+    this.persistInFlight = next.finally(() => {
+      if (this.persistInFlight === next) {
+        // Avoid holding onto already-settled promises.
+        this.persistInFlight = null;
+      }
+    });
+    await this.persistInFlight;
+  }
+
+  async migrate(): Promise<void> {
+    await this.exec(`
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
         repo_name TEXT,
@@ -116,24 +165,28 @@ export class SqlJsDb implements IDb {
     `);
   }
 
-  close(): void {
+  async close(): Promise<void> {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = undefined;
+    }
     if (this.persistPath) {
-      const data = this.db.export();
-      fs.mkdirSync(path.dirname(this.persistPath), { recursive: true });
-      fs.writeFileSync(this.persistPath, Buffer.from(data));
+      await this.persistNow();
     }
     this.db.close();
   }
 
-  exec(sql: string, params?: unknown[]): void {
+  async exec(sql: string, params?: unknown[]): Promise<void> {
     if (params && params.length > 0) {
       this.db.run(sql, params as any[]);
+      this.schedulePersist();
       return;
     }
     this.db.run(sql);
+    this.schedulePersist();
   }
 
-  query<T = Record<string, unknown>>(sql: string, params?: unknown[]): T[] {
+  async query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]> {
     const stmt = this.db.prepare(sql);
     if (params && params.length > 0) {
       stmt.bind(params as any[]);
@@ -146,56 +199,55 @@ export class SqlJsDb implements IDb {
     return rows;
   }
 
-  transaction<T>(fn: () => T): T {
-    this.exec("BEGIN");
+  async transaction<T>(fn: () => Promise<T>): Promise<T> {
+    this.inTransactionDepth += 1;
+    await this.exec("BEGIN");
     try {
-      const result = fn();
-      this.exec("COMMIT");
+      const result = await fn();
+      await this.exec("COMMIT");
       return result;
     } catch (err) {
-      this.exec("ROLLBACK");
+      await this.exec("ROLLBACK");
       throw err;
+    } finally {
+      this.inTransactionDepth = Math.max(0, this.inTransactionDepth - 1);
+      if (this.inTransactionDepth === 0 && this.persistPendingAfterTx) {
+        this.persistPendingAfterTx = false;
+        this.schedulePersist();
+      }
     }
   }
 }
 
-export class PostgresDb implements IDb {
-  migrate(): void {
-    throw new Error("PostgresDb not implemented");
-  }
-  close(): void {
-    throw new Error("PostgresDb not implemented");
-  }
-  exec(): void {
-    throw new Error("PostgresDb not implemented");
-  }
-  query(): any[] {
-    throw new Error("PostgresDb not implemented");
-  }
-  transaction<T>(): T {
-    throw new Error("PostgresDb not implemented");
+export { PgDb, createPgDb, PgDbOptions } from "./pg-db";
+
+function resolveDriver(raw?: string): DbDriver {
+  const value = (raw ?? "").toLowerCase();
+  if (value === "postgres") return "postgres";
+  return "sqljs";
+}
+
+async function ensureDevKey(db: IDb): Promise<void> {
+  const hasDevKey = (await db.query("SELECT key FROM api_keys WHERE key = ?", ["dev"]))[0];
+  if (!hasDevKey) {
+    await db.exec(
+      "INSERT INTO api_keys (key, org_id, user_id, plan_id, created_at) VALUES (?, ?, ?, ?, ?)",
+      ["dev", "org_demo", "user_demo", "pro_solo", new Date().toISOString()]
+    );
   }
 }
 
 export async function createDb(pathOverride?: string): Promise<IDb> {
-  const driver = (process.env.TRCODER_DB_DRIVER ?? "sqljs").toLowerCase();
+  const driver = resolveDriver(process.env.TRCODER_DB_DRIVER);
   if (driver === "postgres") {
-    const db = new PostgresDb();
-    db.migrate();
+    const db = await createPgDb();
+    await ensureDevKey(db);
     return db;
   }
 
   const dbPath = pathOverride || process.env.TRCODER_DB_PATH;
   const db = await SqlJsDb.create(dbPath && dbPath !== ":memory:" ? dbPath : undefined);
-  db.migrate();
-
-  const hasDevKey = db.query("SELECT key FROM api_keys WHERE key = ?", ["dev"])[0];
-  if (!hasDevKey) {
-    db.exec(
-      "INSERT INTO api_keys (key, org_id, user_id, plan_id, created_at) VALUES (?, ?, ?, ?, ?)",
-      ["dev", "org_demo", "user_demo", "pro_solo", new Date().toISOString()]
-    );
-  }
-
+  await db.migrate();
+  await ensureDevKey(db);
   return db;
 }

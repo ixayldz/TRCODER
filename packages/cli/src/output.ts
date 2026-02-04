@@ -1,6 +1,8 @@
+import { styleText } from "./theme";
+
 export function formatRunBanner(data: any): string {
   return [
-    "=== RUN ===",
+    styleText("=== RUN ===", "header"),
     `Plan: ${data.plan_type} (${data.plan_id ?? "n/a"}) | Lane: ${data.lane} | Risk: ${data.risk} | Gates: ${data.gates_mode}`,
     `Repo: ${data.repo} | Commit: ${data.commit}`,
     `Approved Plan: ${data.approved_plan_id}`
@@ -11,7 +13,7 @@ export function formatTaskHeader(data: any): string {
   const budgets = data.context_pack?.budgets ?? {};
   const mode = data.context_pack?.mode ?? "manifest";
   return [
-    "--- TASK ---",
+    styleText("--- TASK ---", "header"),
     `Task: ${data.task_id} - ${data.title} (${data.task_type})`,
     `Model: ${data.selected_model}`,
     `Context: ${data.context_pack?.id} (${mode}) | files ${budgets.max_files} lines ${budgets.max_lines} depth ${budgets.graph_depth} topk ${budgets.top_k}`,
@@ -21,7 +23,7 @@ export function formatTaskHeader(data: any): string {
 
 export function formatStage(data: any): string {
   const ts = new Date().toLocaleTimeString();
-  return `[${ts}] ${data.stage}: ${data.message}`;
+  return styleText(`[${ts}] ${data.stage}: ${data.message}`, "stage");
 }
 
 export function formatTaskResult(data: any): string {
@@ -29,7 +31,7 @@ export function formatTaskResult(data: any): string {
   const riskLine = data.risk_notes ? `Risk Notes: ${data.risk_notes.join(", ")}` : "Risk Notes: n/a";
   const rollbackLine = data.rollback_notes ? `Rollback Notes: ${data.rollback_notes.join(", ")}` : "Rollback Notes: n/a";
   return [
-    "--- RESULT ---",
+    styleText("--- RESULT ---", "header"),
     data.patch_path ? `Patch: ${data.patch_path}` : "Patch: n/a",
     data.changed_files !== undefined ? `Changed Files: ${data.changed_files}` : "Changed Files: n/a",
     `Verify: ${data.verify_status ?? "n/a"}`,
@@ -42,7 +44,7 @@ export function formatTaskResult(data: any): string {
 
 export function formatAnomaly(data: any): string {
   return [
-    "!!! ANOMALY !!!",
+    styleText("!!! ANOMALY !!!", "header"),
     `Expected(p90): $${data.expected_p90} | Actual: $${data.actual}`,
     `Reason: ${data.reason}`,
     `Action: ${data.action}`,
@@ -63,7 +65,7 @@ export function formatSessionStats(data: any): string {
         .join(" | ")
     : "n/a";
   return [
-    "=== SESSION STATS ===",
+    styleText("=== SESSION STATS ===", "header"),
     `Elapsed: ${mins}m ${secs}s | Tasks: ${data.tasks_completed}/${data.tasks_total}`,
     `Cost: $${data.cost_to_date_usd} | Remaining: $${data.budget_remaining_usd}`,
     `Model usage: ${usage}`

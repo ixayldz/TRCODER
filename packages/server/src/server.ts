@@ -23,7 +23,7 @@ import { createDb } from "./db";
 import { writeArtifact, writePlanArtifact } from "./artifacts";
 import { buildContextPack } from "./context-pack";
 import { getContextPackRecord, saveContextPack, updateContextPack } from "./context-pack-store";
-import { MockModelProvider } from "./mock-provider";
+import { getProviderFactory } from "./providers";
 import { RunEventHub } from "./run-events";
 import { appendLedgerEvent, listLedgerEvents } from "./ledger-store";
 import { RunnerBridge } from "./runner-bridge";
@@ -31,6 +31,9 @@ import { computeInvoicePreview, computeUsageForMonth, computeUsageForRange } fro
 import { redactText } from "./redaction";
 import { getArtifactsDir } from "./storage";
 import { buildOpsPackPatch } from "./ops-pack";
+import { generateTasksForPlan } from "./planner";
+import { parseJsonValue } from "./utils/json";
+import { GitHubAdapter } from "./pr-adapters";
 
 interface AuthContext {
   api_key: string;
@@ -97,10 +100,84 @@ function trimSnippet(text: string, maxChars = 200): string {
   return text.slice(0, maxChars) + "...";
 }
 
+function isSafePin(pin: string): boolean {
+  const trimmed = pin.trim();
+  if (!trimmed) return false;
+
+  // Pins must be repo-relative paths/globs (no absolute paths).
+  if (
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("\\") ||
+    trimmed.startsWith("\\\\") ||
+    /^[a-zA-Z]:[\\/]/.test(trimmed)
+  ) {
+    return false;
+  }
+
+  // Prevent parent traversal and other surprising inputs.
+  if (trimmed.includes("..")) return false;
+
+  const lower = trimmed.toLowerCase();
+  // Avoid accidentally pinning OS/user temp folders or obvious secret files.
+  if (lower.includes("appdata") || lower.includes("temp") || lower.includes("tmp")) return false;
+  if (
+    lower.includes("secret") ||
+    lower.includes("token") ||
+    lower.includes("apikey") ||
+    lower.includes("api_key") ||
+    lower.includes("password")
+  ) {
+    return false;
+  }
+  if (
+    lower === ".env" ||
+    lower.endsWith("/.env") ||
+    lower.endsWith("\\.env") ||
+    lower.includes("/.env.") ||
+    lower.includes("\\.env.")
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function sanitizePins(pins: string[]): { pins: string[]; droppedCount: number } {
+  const out: string[] = [];
+  let droppedCount = 0;
+  for (const raw of pins) {
+    const pin = (raw ?? "").trim();
+    if (!pin) continue;
+    if (!isSafePin(pin)) {
+      droppedCount += 1;
+      continue;
+    }
+    if (!out.includes(pin)) out.push(pin);
+  }
+  return { pins: out, droppedCount };
+}
+
 function globMatch(pattern: string, value: string): boolean {
   const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&");
   const regex = new RegExp(`^${escaped.replace(/\*/g, ".*")}$`, "i");
   return regex.test(value);
+}
+
+function parseGitHubRemote(remoteUrl: string): { owner: string; repo: string } | null {
+  const trimmed = remoteUrl.trim().replace(/\.git$/, "");
+  const httpsMatch = trimmed.match(/^https?:\/\/github\.com\/([^/]+)\/([^/]+)$/i);
+  if (httpsMatch) {
+    return { owner: httpsMatch[1], repo: httpsMatch[2] };
+  }
+  const sshMatch = trimmed.match(/^git@github\.com:([^/]+)\/([^/]+)$/i);
+  if (sshMatch) {
+    return { owner: sshMatch[1], repo: sshMatch[2] };
+  }
+  const sshUrlMatch = trimmed.match(/^ssh:\/\/git@github\.com\/([^/]+)\/([^/]+)$/i);
+  if (sshUrlMatch) {
+    return { owner: sshUrlMatch[1], repo: sshUrlMatch[2] };
+  }
+  return null;
 }
 
 export async function createServer(options?: {
@@ -147,36 +224,44 @@ export async function createServer(options?: {
   if (options?.onRoute) {
     app.addHook("onRoute", options.onRoute);
   }
+  app.addHook("onClose", async () => {
+    await db.close();
+  });
   const events = new RunEventHub();
-  const modelProvider = new MockModelProvider();
+  const providerFactory = getProviderFactory({
+    fallbackChains: modelStack.fallback_chains,
+    useMock: process.env.TRCODER_USE_MOCK_PROVIDER === "true"
+  });
   const runnerBridge = new RunnerBridge(
     app.server,
     permissions,
-    (req) => {
+    async (req) => {
       const auth = req.headers["authorization"];
       const projectHeader = req.headers["x-trcoder-project"];
       if (!auth || !auth.toString().startsWith("Bearer ")) {
         return null;
       }
       const api_key = auth.toString().slice("Bearer ".length);
-      const record = db.query<{ org_id: string; user_id: string }>(
-        "SELECT org_id, user_id FROM api_keys WHERE key = ?",
-        [api_key]
+      const record = (
+        await db.query<{ org_id: string; user_id: string }>(
+          "SELECT org_id, user_id FROM api_keys WHERE key = ?",
+          [api_key]
+        )
       )[0];
       if (!record || !projectHeader) {
         return null;
       }
       const project_id = projectHeader.toString();
-      const project = db.query("SELECT id FROM projects WHERE id = ?", [project_id])[0];
+      const project = (await db.query("SELECT id FROM projects WHERE id = ?", [project_id]))[0];
       if (!project) {
         return null;
       }
       return { project_id, org_id: record.org_id, user_id: record.user_id };
     },
-    (req, reason) => {
+    async (req, reason) => {
       const projectHeader = req.headers["x-trcoder-project"];
       const project_id = projectHeader ? projectHeader.toString() : "unknown";
-      appendLedgerEvent(
+      await appendLedgerEvent(
         db,
         createLedgerEvent({
           org_id: "unknown",
@@ -230,24 +315,25 @@ export async function createServer(options?: {
     return tasks.phases.reduce((total, phase) => total + phase.tasks.length, 0);
   }
 
-  function computeSessionStats(runId: string) {
-    const run = db.query<Record<string, unknown>>("SELECT * FROM runs WHERE id = ?", [runId])[0] as
-      | { created_at: string; cost_to_date: number; budget_cap_usd: number; plan_id: string }
+  async function computeSessionStats(runId: string) {
+    const run = (await db.query<Record<string, unknown>>("SELECT * FROM runs WHERE id = ?", [runId]))[0] as
+      | { created_at: string; cost_to_date: number | string; budget_cap_usd: number | string; plan_id: string }
       | undefined;
     if (!run) return null;
 
-    const planRow = db.query<{ tasks_json?: string }>(
+    const planRow = (await db.query<{ tasks_json?: unknown }>(
       "SELECT tasks_json FROM plans WHERE id = ?",
       [run.plan_id]
-    )[0];
-    const tasksFile = planRow?.tasks_json ? (JSON.parse(planRow.tasks_json) as TasksFileV1) : null;
+    ))[0];
+    const tasksFile = parseJsonValue<TasksFileV1 | null>(planRow?.tasks_json, null);
     const tasks_total = tasksFile ? getPlanTasksCount(tasksFile) : 0;
-    const tasks_completed = db.query<{ cnt: number }>(
+    const tasksCompletedRow = (await db.query<{ cnt: number | string }>(
       "SELECT COUNT(1) as cnt FROM tasks WHERE run_id = ? AND state = ?",
       [runId, "DONE"]
-    )[0] ?? { cnt: 0 };
+    ))[0];
+    const tasks_completed = Number(tasksCompletedRow?.cnt ?? 0);
 
-    const events = listLedgerEvents(db, "1970-01-01T00:00:00.000Z", new Date().toISOString()).filter(
+    const events = (await listLedgerEvents(db, "1970-01-01T00:00:00.000Z", new Date().toISOString())).filter(
       (event) => event.run_id === runId && event.event_type === "LLM_CALL_FINISHED"
     );
     const modelMap = new Map<string, { calls: number; provider: number; charge: number }>();
@@ -263,13 +349,15 @@ export async function createServer(options?: {
       modelMap.set(model, entry);
     }
 
+    const cost_to_date = Number(run.cost_to_date ?? 0);
+    const budget_cap_usd = Number(run.budget_cap_usd ?? 0);
     const elapsed = Math.max(0, Date.now() - new Date(run.created_at).getTime());
     return {
       time_elapsed_sec: Math.round(elapsed / 1000),
-      tasks_completed: tasks_completed.cnt,
+      tasks_completed,
       tasks_total,
-      cost_to_date_usd: run.cost_to_date,
-      budget_remaining_usd: run.budget_cap_usd - run.cost_to_date,
+      cost_to_date_usd: cost_to_date,
+      budget_remaining_usd: budget_cap_usd - cost_to_date,
       model_usage: Array.from(modelMap.entries()).map(([model, totals]) => ({
         model,
         calls: totals.calls,
@@ -336,7 +424,7 @@ export async function createServer(options?: {
     return { stale: false, reason: null as string | null };
   }
 
-  function emitTaskStage(input: {
+  async function emitTaskStage(input: {
     run_id: string;
     task_id: string;
     stage: string;
@@ -345,7 +433,7 @@ export async function createServer(options?: {
     user_id: string;
     project_id: string;
     plan_id: string;
-  }) {
+  }): Promise<void> {
     events.emit(input.run_id, {
       type: "TASK_STAGE",
       ts: new Date().toISOString(),
@@ -357,7 +445,7 @@ export async function createServer(options?: {
       }
     });
 
-    appendLedgerEvent(
+    await appendLedgerEvent(
       db,
       createLedgerEvent({
         org_id: input.org_id,
@@ -372,17 +460,20 @@ export async function createServer(options?: {
     );
   }
 
-  function requireAuth(req: FastifyRequest, reply: FastifyReply): AuthContext | null {
+  async function requireAuth(
+    req: FastifyRequest,
+    reply: FastifyReply
+  ): Promise<AuthContext | null> {
     const auth = req.headers["authorization"];
     if (!auth || !auth.toString().startsWith("Bearer ")) {
       reply.code(401).send({ error: "missing api key" });
       return null;
     }
     const api_key = auth.toString().slice("Bearer ".length);
-    const record = db.query<Record<string, string>>(
+    const record = (await db.query<Record<string, string>>(
       "SELECT * FROM api_keys WHERE key = ?",
       [api_key]
-    )[0] as
+    ))[0] as
       | { key: string; org_id: string; user_id: string; plan_id: string }
       | undefined;
     if (!record) {
@@ -393,24 +484,41 @@ export async function createServer(options?: {
   }
 
   app.post("/v1/projects/connect", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
 
     const body = req.body as { repo_name: string; repo_root_hash: string };
+    const repo_name = String(body.repo_name ?? "").trim();
+    const repo_root_hash = String(body.repo_root_hash ?? "").trim();
+    if (!repo_name || !repo_root_hash) {
+      reply.code(400).send({ error: "repo_name and repo_root_hash required" });
+      return;
+    }
+
+    // Idempotent connect: repo_root_hash is treated as the stable repo identity.
+    const existing = (await db.query<{ id: string }>(
+      "SELECT id FROM projects WHERE repo_root_hash = ? ORDER BY created_at DESC LIMIT 1",
+      [repo_root_hash]
+    ))[0];
+    if (existing?.id) {
+      reply.send({ project_id: existing.id });
+      return;
+    }
+
     const project_id = randomUUID();
-    db.exec(
+    await db.exec(
       "INSERT INTO projects (id, repo_name, repo_root_hash, created_at) VALUES (?, ?, ?, ?)",
-      [project_id, body.repo_name, body.repo_root_hash, new Date().toISOString()]
+      [project_id, repo_name, repo_root_hash, new Date().toISOString()]
     );
 
     reply.send({ project_id });
   });
 
   app.get("/v1/whoami", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
 
-    const usage = computeUsageForMonth({ db, pricing, plan_id: auth.plan_id });
+    const usage = await computeUsageForMonth({ db, pricing, plan_id: auth.plan_id });
     reply.send({
       org_id: auth.org_id,
       user_id: auth.user_id,
@@ -422,18 +530,146 @@ export async function createServer(options?: {
   });
 
   app.post("/v1/projects/:id/plan", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
 
     const project_id = (req.params as { id: string }).id;
-    const body = (req.body ?? {}) as { input?: { text?: string; files?: Array<{ path: string; content: string }> }; pins?: string[] };
+    const body = (req.body ?? {}) as {
+      input?: { text?: string; files?: Array<{ path: string; content: string }> };
+      pins?: string[];
+      lane?: Lane;
+      risk?: RiskLevel;
+      budget_cap_usd?: number;
+    };
+
+    const projectRow = (await db.query<{ repo_name?: string }>(
+      "SELECT repo_name FROM projects WHERE id = ?",
+      [project_id]
+    ))[0];
+    if (!projectRow) {
+      reply.code(404).send({ error: "project not found" });
+      return;
+    }
 
     const plan_id = `plan_${Date.now()}`;
-    const tasks = loadExampleTasks(repoRoot);
-    tasks.plan_id = plan_id;
+    const sanitized = sanitizePins((body.pins ?? []).filter(Boolean));
+    const pins = sanitized.pins;
+    const warnings: string[] = [];
+    if (sanitized.droppedCount > 0) {
+      warnings.push(
+        `Dropped ${sanitized.droppedCount} unsafe pin(s). Pins must be repo-relative paths/globs and should not target secrets.`
+      );
+    }
 
-    const planMd = `# Plan ${plan_id}\n\nGenerated by TRCODER mock planner.`;
-    const risksMd = `# Risks\n\n- Mock risk list (V1).`;
+    const lane: Lane =
+      body.lane && lanePolicy.lanes[body.lane as Lane] ? (body.lane as Lane) : "balanced";
+    const risk: RiskLevel =
+      body.risk && riskPolicy.risk_levels[body.risk as RiskLevel]
+        ? (body.risk as RiskLevel)
+        : "standard";
+    const budget_cap_usd = typeof body.budget_cap_usd === "number" ? body.budget_cap_usd : undefined;
+
+    const redText = redactText((body.input?.text ?? "").trim());
+    const inputText = redText.text;
+    const inputFiles = (body.input?.files ?? [])
+      .filter((f) => Boolean(f?.path))
+      .map((f) => ({
+        path: String(f.path ?? ""),
+        content: limitText(redactText(String(f.content ?? "")).text, 20000)
+      }))
+      .filter((f) => f.path);
+    const pinnedFiles = inputFiles.map((f) => f.path).filter(Boolean);
+
+    const projectName = (projectRow.repo_name ?? "project").trim() || "project";
+
+    const contextBudget = lanePolicy.lanes[lane]?.context_budget ?? lanePolicy.lanes.balanced.context_budget;
+    const plannerDecision = decideRouter({
+      taskType: "project_planning",
+      lane,
+      risk,
+      budgetRemainingUsd: budget_cap_usd,
+      contextBudget,
+      modelStack,
+      lanePolicy,
+      riskPolicy
+    });
+    const plannerProviderSelection = await providerFactory.getProviderWithFallback(plannerDecision.selected_model);
+
+    const planningRequestText =
+      inputText ||
+      (inputFiles.length > 0 ? inputFiles.map((f) => `# ${f.path}\n\n${f.content}`).join("\n\n") : "");
+
+    const allowedTaskTypes = Object.keys(modelStack.task_type_map ?? {});
+    const taskGen = await generateTasksForPlan({
+      provider: plannerProviderSelection.provider,
+      model: plannerProviderSelection.selectedModel,
+      planId: plan_id,
+      projectName,
+      requestText: planningRequestText,
+      inputFiles,
+      lane,
+      risk,
+      allowedTaskTypes
+    });
+
+    if (taskGen.warnings.length > 0) {
+      warnings.push(...taskGen.warnings);
+    }
+
+    const tasks = taskGen.tasks;
+
+    // Preview how routing will split responsibility across models for this plan.
+    const routingLines = tasks.phases
+      .flatMap((phase) =>
+        phase.tasks.map((task) => {
+          const d = decideRouter({
+            taskType: task.type,
+            lane,
+            risk,
+            budgetRemainingUsd: budget_cap_usd,
+            contextBudget,
+            modelStack,
+            lanePolicy,
+            riskPolicy
+          });
+          return `- [${phase.id}] ${task.id}: ${task.title} (${task.type}, risk=${task.risk}) -> ${d.selected_model}`;
+        })
+      )
+      .join("\n");
+
+    const planMd = [
+      `# Plan ${plan_id}`,
+      "",
+      `Generated by TRCODER planner (V1). Source: ${taskGen.source}.`,
+      "",
+      "## Router Roles (preview)",
+      `- planner: project_planning -> ${plannerDecision.selected_model} (actual: ${plannerProviderSelection.selectedModel})`,
+      "",
+      inputText ? "## Request" : null,
+      inputText ? inputText : null,
+      "",
+      warnings.length > 0 ? "## Warnings" : null,
+      warnings.length > 0 ? warnings.map((w) => `- ${w}`).join("\n") : null,
+      "",
+      pins.length > 0 ? "## Pins" : null,
+      pins.length > 0 ? pins.map((p) => `- ${p}`).join("\n") : null,
+      "",
+      pinnedFiles.length > 0 ? "## Input Files" : null,
+      pinnedFiles.length > 0 ? pinnedFiles.map((p) => `- ${p}`).join("\n") : null,
+      "",
+      "## Tasks",
+      routingLines || "- (no tasks)",
+      ""
+    ]
+      .filter((line) => line !== null)
+      .join("\n");
+
+    const risksMd = [
+      "# Risks",
+      "",
+      "- Mock risk list (V1).",
+      "- Real risk generation will be model-driven later."
+    ].join("\n");
 
     const planArtifact = writePlanArtifact(plan_id, "plan.md", planMd);
     const tasksArtifact = writePlanArtifact(plan_id, "tasks.v1.json", JSON.stringify(tasks, null, 2));
@@ -445,7 +681,78 @@ export async function createServer(options?: {
       { path: `artifacts/${project_id}/${plan_id}/risks.md`, kind: "risks.md" }
     ];
 
-    db.exec(
+    if (taskGen.usage) {
+      const usageSoFar = await computeUsageForMonth({ db, pricing, plan_id: auth.plan_id });
+      const creditsRemaining = Math.max(
+        0,
+        (pricing.plans[auth.plan_id]?.included_credits_trc ?? 0) - usageSoFar.credits_used
+      );
+
+      const tokensEstimate = estimateTokens("project_planning", lane, risk);
+      const tokensIn =
+        typeof taskGen.usage?.prompt_tokens === "number"
+          ? taskGen.usage.prompt_tokens
+          : Math.round(tokensEstimate * 0.7);
+      const tokensOut =
+        typeof taskGen.usage?.completion_tokens === "number"
+          ? taskGen.usage.completion_tokens
+          : Math.round(tokensEstimate * 0.3);
+
+      const cost = calculateCost({
+        model: plannerProviderSelection.selectedModel,
+        tokens_in: tokensIn,
+        tokens_out: tokensOut,
+        pricing,
+        modelStack,
+        plan_id: auth.plan_id,
+        credits_remaining_trc: creditsRemaining
+      });
+
+      await appendLedgerEvent(
+        db,
+        createLedgerEvent({
+          org_id: auth.org_id,
+          user_id: auth.user_id,
+          project_id,
+          plan_id,
+          event_type: "LLM_CALL_STARTED",
+          payload: {
+            model: plannerProviderSelection.selectedModel,
+            requested_model: plannerDecision.selected_model,
+            provider: plannerProviderSelection.provider.name,
+            used_fallback: plannerProviderSelection.usedFallback,
+            task_type: "plan"
+          }
+        })
+      );
+
+      await appendLedgerEvent(
+        db,
+        createLedgerEvent({
+          org_id: auth.org_id,
+          user_id: auth.user_id,
+          project_id,
+          plan_id,
+          event_type: "LLM_CALL_FINISHED",
+          payload: {
+            model: plannerProviderSelection.selectedModel,
+            requested_model: plannerDecision.selected_model,
+            provider: plannerProviderSelection.provider.name,
+            used_fallback: plannerProviderSelection.usedFallback,
+            task_type: "plan",
+            tokens_in: tokensIn,
+            tokens_out: tokensOut,
+            provider_cost_usd: cost.provider_cost_usd,
+            credits_applied_usd: cost.credits_applied_usd,
+            billable_provider_cost_usd: cost.billable_provider_cost_usd,
+            markup_rate: cost.markup_rate,
+            our_charge_usd: cost.our_charge_usd
+          }
+        })
+      );
+    }
+
+    await db.exec(
       "INSERT INTO plans (id, project_id, created_at, approved_at, repo_commit, artifacts_json, tasks_json, input_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       [
         plan_id,
@@ -455,7 +762,13 @@ export async function createServer(options?: {
         null,
         JSON.stringify(artifacts),
         JSON.stringify(tasks),
-        JSON.stringify({ input: body.input ?? {}, pins: body.pins ?? [] })
+        JSON.stringify({
+          input: {
+            text: inputText,
+            files: pinnedFiles.map((p) => ({ path: p }))
+          },
+          pins
+        })
       ]
     );
 
@@ -467,18 +780,179 @@ export async function createServer(options?: {
       event_type: "PLAN_CREATED",
       payload: { artifacts }
     });
-    appendLedgerEvent(db, planEvent);
+    await appendLedgerEvent(db, planEvent);
 
-    reply.send({ plan_id, artifacts });
+    reply.send({ plan_id, artifacts, plan_md: planMd, risks_md: risksMd, tasks });
+  });
+
+  app.post("/v1/projects/:id/chat", async (req, reply) => {
+    const auth = await requireAuth(req, reply);
+    if (!auth) return;
+
+    const project_id = (req.params as { id: string }).id;
+    const body = (req.body ?? {}) as {
+      message?: string;
+      messages?: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+      lane?: Lane;
+      risk?: RiskLevel;
+      budget_cap_usd?: number;
+    };
+
+    const project = (await db.query("SELECT id FROM projects WHERE id = ?", [project_id]))[0];
+    if (!project) {
+      reply.code(404).send({ error: "project not found" });
+      return;
+    }
+
+    const lane: Lane =
+      body.lane && lanePolicy.lanes[body.lane as Lane] ? (body.lane as Lane) : "balanced";
+    const risk: RiskLevel =
+      body.risk && riskPolicy.risk_levels[body.risk as RiskLevel]
+        ? (body.risk as RiskLevel)
+        : "standard";
+    const budget_cap_usd = typeof body.budget_cap_usd === "number" ? body.budget_cap_usd : undefined;
+
+    const rawMessages: Array<{ role: "system" | "user" | "assistant"; content: string }> =
+      Array.isArray(body.messages) && body.messages.length > 0
+        ? body.messages
+        : typeof body.message === "string" && body.message.trim().length > 0
+          ? [{ role: "user", content: body.message }]
+          : [];
+
+    const history = rawMessages
+      .filter(
+        (m): m is { role: "user" | "assistant"; content: string } =>
+          Boolean(m) &&
+          (m.role === "user" || m.role === "assistant") &&
+          typeof m.content === "string" &&
+          m.content.trim().length > 0
+      )
+      .map((m) => {
+        const red = redactText(m.content);
+        return { role: m.role, content: limitText(red.text, 8000) };
+      })
+      .slice(-20);
+
+    if (history.length === 0) {
+      reply.code(400).send({ error: "message required" });
+      return;
+    }
+    if (history[history.length - 1].role !== "user") {
+      reply.code(400).send({ error: "last message must be user" });
+      return;
+    }
+
+    const contextBudget = lanePolicy.lanes[lane]?.context_budget ?? lanePolicy.lanes.balanced.context_budget;
+    const routerDecision = decideRouter({
+      taskType: "project_planning",
+      lane,
+      risk,
+      budgetRemainingUsd: budget_cap_usd,
+      contextBudget,
+      modelStack,
+      lanePolicy,
+      riskPolicy
+    });
+
+    const providerSelection = await providerFactory.getProviderWithFallback(routerDecision.selected_model);
+
+    const llmStart = createLedgerEvent({
+      org_id: auth.org_id,
+      user_id: auth.user_id,
+      project_id,
+      event_type: "LLM_CALL_STARTED",
+      payload: {
+        model: providerSelection.selectedModel,
+        requested_model: routerDecision.selected_model,
+        provider: providerSelection.provider.name,
+        used_fallback: providerSelection.usedFallback,
+        task_type: "chat"
+      }
+    });
+    await appendLedgerEvent(db, llmStart);
+
+    const systemPrompt =
+      "You are TRCODER interactive shell assistant. Be concise and practical. " +
+      "Do not claim to have applied changes unless the user ran /apply. " +
+      "Respect patch-first: suggest /plan and /start for execution.";
+
+    const completion = await providerSelection.provider.chat({
+      model: providerSelection.selectedModel,
+      messages: [{ role: "system", content: systemPrompt }, ...history],
+      temperature: 0.2
+    });
+
+    const usageSoFar = await computeUsageForMonth({ db, pricing, plan_id: auth.plan_id });
+    const creditsRemaining = Math.max(
+      0,
+      (pricing.plans[auth.plan_id]?.included_credits_trc ?? 0) - usageSoFar.credits_used
+    );
+
+    const tokensEstimate = estimateTokens("project_planning", lane, risk);
+    const tokensIn =
+      typeof completion.usage?.prompt_tokens === "number"
+        ? completion.usage.prompt_tokens
+        : Math.round(tokensEstimate * 0.7);
+    const tokensOut =
+      typeof completion.usage?.completion_tokens === "number"
+        ? completion.usage.completion_tokens
+        : Math.round(tokensEstimate * 0.3);
+
+    const cost = calculateCost({
+      model: providerSelection.selectedModel,
+      tokens_in: tokensIn,
+      tokens_out: tokensOut,
+      pricing,
+      modelStack,
+      plan_id: auth.plan_id,
+      credits_remaining_trc: creditsRemaining
+    });
+
+    const llmFinish = createLedgerEvent({
+      org_id: auth.org_id,
+      user_id: auth.user_id,
+      project_id,
+      event_type: "LLM_CALL_FINISHED",
+      payload: {
+        model: providerSelection.selectedModel,
+        requested_model: routerDecision.selected_model,
+        provider: providerSelection.provider.name,
+        used_fallback: providerSelection.usedFallback,
+        task_type: "chat",
+        tokens_in: tokensIn,
+        tokens_out: tokensOut,
+        provider_cost_usd: cost.provider_cost_usd,
+        credits_applied_usd: cost.credits_applied_usd,
+        billable_provider_cost_usd: cost.billable_provider_cost_usd,
+        markup_rate: cost.markup_rate,
+        our_charge_usd: cost.our_charge_usd
+      }
+    });
+    await appendLedgerEvent(db, llmFinish);
+
+    reply.send({
+      message: completion.content,
+      model: providerSelection.selectedModel,
+      requested_model: routerDecision.selected_model,
+      provider: providerSelection.provider.name,
+      used_fallback: providerSelection.usedFallback,
+      tokens: { input: tokensIn, output: tokensOut },
+      cost: {
+        provider_cost_usd: cost.provider_cost_usd,
+        credits_applied_usd: cost.credits_applied_usd,
+        billable_provider_cost_usd: cost.billable_provider_cost_usd,
+        our_charge_usd: cost.our_charge_usd
+      }
+    });
   });
 
   app.post("/v1/projects/:id/plan/approve", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const project_id = (req.params as { id: string }).id;
     const body = req.body as { plan_id: string; repo_commit: string };
 
-    db.exec("UPDATE plans SET approved_at = ?, repo_commit = ? WHERE id = ? AND project_id = ?", [
+    await db.exec("UPDATE plans SET approved_at = ?, repo_commit = ? WHERE id = ? AND project_id = ?", [
       new Date().toISOString(),
       body.repo_commit,
       body.plan_id,
@@ -493,29 +967,29 @@ export async function createServer(options?: {
       event_type: "PLAN_APPROVED",
       payload: { repo_commit: body.repo_commit }
     });
-    appendLedgerEvent(db, event);
+    await appendLedgerEvent(db, event);
 
     reply.send({ ok: true });
   });
 
   app.get("/v1/projects/:id/plan/status", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const project_id = (req.params as { id: string }).id;
 
-    const latest = db.query<{ id?: string; repo_commit?: string }>(
+    const latest = (await db.query<{ id?: string; repo_commit?: string }>(
       "SELECT id, repo_commit FROM plans WHERE project_id = ? ORDER BY created_at DESC LIMIT 1",
       [project_id]
-    )[0];
-    const approved = db.query<{ id?: string; repo_commit?: string }>(
+    ))[0];
+    const approved = (await db.query<{ id?: string; repo_commit?: string }>(
       "SELECT id, repo_commit FROM plans WHERE project_id = ? AND approved_at IS NOT NULL ORDER BY approved_at DESC LIMIT 1",
       [project_id]
-    )[0];
+    ))[0];
 
     const repoState = await getRepoState(project_id);
     const staleInfo = computeStale(approved?.repo_commit, repoState);
 
-    appendLedgerEvent(
+    await appendLedgerEvent(
       db,
       createLedgerEvent({
         org_id: auth.org_id,
@@ -548,7 +1022,7 @@ export async function createServer(options?: {
   });
 
   app.post("/v1/projects/:id/runs/start", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const project_id = (req.params as { id: string }).id;
     const body = (req.body ?? {}) as {
@@ -574,10 +1048,10 @@ export async function createServer(options?: {
       return;
     }
 
-    const planRow = db.query<{ id: string; tasks_json: string; input_json: string; repo_commit?: string }>(
+    const planRow = (await db.query<{ id: string; tasks_json: unknown; input_json: unknown; repo_commit?: string }>(
       "SELECT id, tasks_json, input_json, repo_commit FROM plans WHERE project_id = ? AND approved_at IS NOT NULL ORDER BY approved_at DESC LIMIT 1",
       [project_id]
-    )[0];
+    ))[0];
 
     const plan_id = body.plan_id ?? planRow?.id;
     if (!plan_id || !planRow) {
@@ -604,7 +1078,7 @@ export async function createServer(options?: {
     const risk = body.risk ?? "standard";
     const budget_cap_usd = body.budget_cap_usd ?? 10;
 
-    db.exec(
+    await db.exec(
       "INSERT INTO runs (id, project_id, plan_id, state, lane, risk, budget_cap_usd, cost_to_date, current_task_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       [
         run_id,
@@ -621,7 +1095,11 @@ export async function createServer(options?: {
       ]
     );
 
-    const tasks = JSON.parse(planRow.tasks_json) as TasksFileV1;
+    const tasks = parseJsonValue<TasksFileV1 | null>(planRow.tasks_json, null);
+    if (!tasks) {
+      reply.code(500).send({ error: "invalid tasks payload" });
+      return;
+    }
     const taskId = body.task_id;
     const allTasks = tasks.phases.flatMap((phase) => phase.tasks);
     const firstTask = taskId ? allTasks.find((task) => task.id === taskId) : allTasks[0];
@@ -642,7 +1120,7 @@ export async function createServer(options?: {
       return;
     }
 
-    db.exec(
+    await db.exec(
       "INSERT INTO tasks (id, run_id, plan_task_id, title, type, risk, state, router_decision_json, patch_path, patch_text, cost_usd, tokens_in, tokens_out) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       [
         randomUUID(),
@@ -700,9 +1178,9 @@ export async function createServer(options?: {
       event_type: "RUN_STARTED",
       payload: { lane, risk, budget_cap_usd }
     });
-    appendLedgerEvent(db, runEvent);
+    await appendLedgerEvent(db, runEvent);
 
-    emitTaskStage({
+    await emitTaskStage({
       run_id,
       task_id: firstTask.id,
       stage: "PREPARE_CONTEXT",
@@ -713,7 +1191,7 @@ export async function createServer(options?: {
       plan_id
     });
 
-    const inputMeta = JSON.parse(planRow.input_json ?? "{}");
+    const inputMeta = parseJsonValue<{ pins?: string[] }>(planRow.input_json, {});
     const pins = (inputMeta.pins ?? []) as string[];
 
     const signals: ContextPackManifest["signals"] = {};
@@ -742,12 +1220,12 @@ export async function createServer(options?: {
       }
     }
 
-    const lastVerify = db.query<{ payload_json?: string }>(
+    const lastVerify = (await db.query<{ payload_json?: unknown }>(
       "SELECT payload_json FROM ledger_events WHERE project_id = ? AND event_type = ? ORDER BY ts DESC LIMIT 1",
       [project_id, "VERIFY_FINISHED"]
-    )[0];
+    ))[0];
     if (lastVerify?.payload_json) {
-      const payload = JSON.parse(lastVerify.payload_json || "{}") as { status?: string; report_path?: string };
+      const payload = parseJsonValue<{ status?: string; report_path?: string }>(lastVerify.payload_json, {});
       if (payload.status === "fail" && payload.report_path) {
         const parts = payload.report_path.split("/");
         const failureRunId = parts.length >= 3 ? parts[2] : run_id;
@@ -773,7 +1251,7 @@ export async function createServer(options?: {
       signals
     });
     contextPack = await enrichContextPack(contextPack, project_id);
-    saveContextPack(db, { project_id, manifest: contextPack });
+    await saveContextPack(db, { project_id, manifest: contextPack });
 
     const ctxEvent = createLedgerEvent({
       org_id: auth.org_id,
@@ -785,7 +1263,7 @@ export async function createServer(options?: {
       event_type: "CONTEXT_PACK_BUILT",
       payload: contextPack as unknown as Record<string, unknown>
     });
-    appendLedgerEvent(db, ctxEvent);
+    await appendLedgerEvent(db, ctxEvent);
 
     const routerDecision = decideRouter({
       taskType: firstTask.type,
@@ -798,7 +1276,7 @@ export async function createServer(options?: {
       riskPolicy
     });
 
-    db.exec("UPDATE tasks SET router_decision_json = ? WHERE run_id = ? AND plan_task_id = ?", [
+    await db.exec("UPDATE tasks SET router_decision_json = ? WHERE run_id = ? AND plan_task_id = ?", [
       JSON.stringify(routerDecision),
       run_id,
       firstTask.id
@@ -814,38 +1292,7 @@ export async function createServer(options?: {
       event_type: "ROUTER_DECISION",
       payload: routerDecision as unknown as Record<string, unknown>
     });
-    appendLedgerEvent(db, routerEvent);
-
-    const taskStartedEvent = createLedgerEvent({
-      org_id: auth.org_id,
-      user_id: auth.user_id,
-      project_id,
-      run_id,
-      plan_id,
-      task_id: firstTask.id,
-      event_type: "TASK_STARTED",
-      payload: { task_id: firstTask.id, title: firstTask.title, type: firstTask.type, risk: firstTask.risk }
-    });
-    appendLedgerEvent(db, taskStartedEvent);
-
-    events.emit(run_id, {
-      type: "TASK_STARTED",
-      ts: new Date().toISOString(),
-      data: {
-        task_id: firstTask.id,
-        title: firstTask.title,
-        task_type: firstTask.type,
-        selected_model: routerDecision.selected_model,
-        context_pack: { id: contextPack.pack_id, budgets: contextPack.budgets, mode: contextPack.mode },
-        expected_cost_range: {
-          p90: Number(routerDecision.expected_cost_usd.toFixed(4)),
-          p50: Number((routerDecision.expected_cost_usd * 0.7).toFixed(4))
-        },
-        budget_remaining: budget_cap_usd,
-        tasks_total,
-        tasks_completed: 0
-      }
-    });
+    await appendLedgerEvent(db, routerEvent);
 
     if (routerDecision.budget_violation) {
       events.emit(run_id, {
@@ -860,7 +1307,7 @@ export async function createServer(options?: {
         }
       });
 
-      db.exec("UPDATE runs SET state = ? WHERE id = ?", ["PAUSED", run_id]);
+      await db.exec("UPDATE runs SET state = ? WHERE id = ?", ["PAUSED", run_id]);
       const anomaly = createLedgerEvent({
         org_id: auth.org_id,
         user_id: auth.user_id,
@@ -871,7 +1318,7 @@ export async function createServer(options?: {
         event_type: "ANOMALY_DETECTED",
         payload: { reason: "budget" }
       });
-      appendLedgerEvent(db, anomaly);
+      await appendLedgerEvent(db, anomaly);
 
       const paused = createLedgerEvent({
         org_id: auth.org_id,
@@ -882,13 +1329,89 @@ export async function createServer(options?: {
         event_type: "RUN_PAUSED",
         payload: { reason: "budget" }
       });
-      appendLedgerEvent(db, paused);
+      await appendLedgerEvent(db, paused);
 
       reply.send({ run_id });
       return;
     }
 
-    emitTaskStage({
+    let providerSelection: Awaited<ReturnType<typeof providerFactory.getProviderWithFallback>>;
+    try {
+      providerSelection = await providerFactory.getProviderWithFallback(routerDecision.selected_model);
+    } catch (err) {
+      events.emit(run_id, {
+        type: "ANOMALY",
+        ts: new Date().toISOString(),
+        data: {
+          expected_p90: routerDecision.expected_cost_usd,
+          actual: 0,
+          reason: "provider unavailable",
+          action: "paused",
+          suggestions: ["/lane set cost-saver", "/context trim"]
+        }
+      });
+      await db.exec("UPDATE runs SET state = ? WHERE id = ?", ["PAUSED", run_id]);
+      await appendLedgerEvent(
+        db,
+        createLedgerEvent({
+          org_id: auth.org_id,
+          user_id: auth.user_id,
+          project_id,
+          run_id,
+          plan_id,
+          task_id: firstTask.id,
+          event_type: "ANOMALY_DETECTED",
+          payload: { reason: "provider_unavailable", error: (err as Error).message }
+        })
+      );
+      reply.code(503).send({ error: "provider_unavailable" });
+      return;
+    }
+
+    const taskStartedEvent = createLedgerEvent({
+      org_id: auth.org_id,
+      user_id: auth.user_id,
+      project_id,
+      run_id,
+      plan_id,
+      task_id: firstTask.id,
+      event_type: "TASK_STARTED",
+      payload: {
+        task_id: firstTask.id,
+        title: firstTask.title,
+        type: firstTask.type,
+        risk: firstTask.risk,
+        provider: providerSelection.provider.name,
+        selected_model: providerSelection.selectedModel,
+        requested_model: routerDecision.selected_model,
+        used_fallback: providerSelection.usedFallback
+      }
+    });
+    await appendLedgerEvent(db, taskStartedEvent);
+
+    events.emit(run_id, {
+      type: "TASK_STARTED",
+      ts: new Date().toISOString(),
+      data: {
+        task_id: firstTask.id,
+        title: firstTask.title,
+        task_type: firstTask.type,
+        selected_model: providerSelection.selectedModel,
+        requested_model: routerDecision.selected_model,
+        provider: providerSelection.provider.name,
+        used_fallback: providerSelection.usedFallback,
+        context_pack: { id: contextPack.pack_id, budgets: contextPack.budgets, mode: contextPack.mode },
+        expected_cost_range: {
+          p90: Number(routerDecision.expected_cost_usd.toFixed(4)),
+          p50: Number((routerDecision.expected_cost_usd * 0.7).toFixed(4))
+        },
+        budget_remaining: budget_cap_usd,
+        tasks_total,
+        tasks_completed: 0
+      }
+    });
+
+    await emitTaskStage({
       run_id,
       task_id: firstTask.id,
       stage: "DESIGN",
@@ -908,20 +1431,33 @@ export async function createServer(options?: {
       plan_id,
       task_id: firstTask.id,
       event_type: "LLM_CALL_STARTED",
-      payload: { model: routerDecision.selected_model }
+      payload: {
+        model: providerSelection.selectedModel,
+        requested_model: routerDecision.selected_model,
+        provider: providerSelection.provider.name,
+        used_fallback: providerSelection.usedFallback
+      }
     });
-    appendLedgerEvent(db, llmStart);
+    await appendLedgerEvent(db, llmStart);
 
-    const mockPatch = await modelProvider.generatePatch({ task_id: firstTask.id });
-    const usageSoFar = computeUsageForMonth({ db, pricing, plan_id: auth.plan_id });
+    const patchResult = await providerSelection.provider.generatePatch({ task_id: firstTask.id });
+    const usageSoFar = await computeUsageForMonth({ db, pricing, plan_id: auth.plan_id });
     const creditsRemaining = Math.max(
       0,
       (pricing.plans[auth.plan_id]?.included_credits_trc ?? 0) - usageSoFar.credits_used
     );
+    const tokensIn =
+      typeof patchResult.usage?.prompt_tokens === "number"
+        ? patchResult.usage.prompt_tokens
+        : Math.round(tokensEstimate * 0.7);
+    const tokensOut =
+      typeof patchResult.usage?.completion_tokens === "number"
+        ? patchResult.usage.completion_tokens
+        : Math.round(tokensEstimate * 0.3);
     const cost = calculateCost({
-      model: routerDecision.selected_model,
-      tokens_in: Math.round(tokensEstimate * 0.7),
-      tokens_out: Math.round(tokensEstimate * 0.3),
+      model: providerSelection.selectedModel,
+      tokens_in: tokensIn,
+      tokens_out: tokensOut,
       pricing,
       modelStack,
       plan_id: auth.plan_id,
@@ -937,10 +1473,13 @@ export async function createServer(options?: {
       task_id: firstTask.id,
       event_type: "LLM_CALL_FINISHED",
       payload: {
-        model: routerDecision.selected_model,
+        model: providerSelection.selectedModel,
+        requested_model: routerDecision.selected_model,
+        provider: providerSelection.provider.name,
+        used_fallback: providerSelection.usedFallback,
         task_type: firstTask.type,
-        tokens_in: Math.round(tokensEstimate * 0.7),
-        tokens_out: Math.round(tokensEstimate * 0.3),
+        tokens_in: tokensIn,
+        tokens_out: tokensOut,
         provider_cost_usd: cost.provider_cost_usd,
         credits_applied_usd: cost.credits_applied_usd,
         billable_provider_cost_usd: cost.billable_provider_cost_usd,
@@ -948,23 +1487,23 @@ export async function createServer(options?: {
         our_charge_usd: cost.our_charge_usd
       }
     });
-    appendLedgerEvent(db, llmFinish);
+    await appendLedgerEvent(db, llmFinish);
 
     const logicalPatchPath = `artifacts/${project_id}/${run_id}/${firstTask.id}/patch.diff`;
-    const patchArtifact = writeArtifact(run_id, `patch_${firstTask.id}.diff`, mockPatch.patchText);
-    db.exec(
+    const patchArtifact = writeArtifact(run_id, `patch_${firstTask.id}.diff`, patchResult.patchText);
+    await db.exec(
       "UPDATE tasks SET patch_path = ?, patch_text = ?, cost_usd = ?, tokens_in = ?, tokens_out = ? WHERE run_id = ? AND plan_task_id = ?",
       [
         patchArtifact.path,
-        mockPatch.patchText,
+        patchResult.patchText,
         cost.our_charge_usd,
-        Math.round(tokensEstimate * 0.7),
-        Math.round(tokensEstimate * 0.3),
+        tokensIn,
+        tokensOut,
         run_id,
         firstTask.id
       ]
     );
-    db.exec("UPDATE runs SET cost_to_date = ?, current_task_id = ? WHERE id = ?", [
+    await db.exec("UPDATE runs SET cost_to_date = ?, current_task_id = ? WHERE id = ?", [
       cost.our_charge_usd,
       firstTask.id,
       run_id
@@ -980,9 +1519,9 @@ export async function createServer(options?: {
       event_type: "PATCH_PRODUCED",
       payload: { patch_path: logicalPatchPath }
     });
-    appendLedgerEvent(db, patchEvent);
+    await appendLedgerEvent(db, patchEvent);
 
-    emitTaskStage({
+    await emitTaskStage({
       run_id,
       task_id: firstTask.id,
       stage: "IMPLEMENT_PATCH",
@@ -998,23 +1537,23 @@ export async function createServer(options?: {
       ts: new Date().toISOString(),
       data: {
         patch_path: logicalPatchPath,
-        patch_text: mockPatch.patchText,
-        changed_files: mockPatch.changedFiles,
+        patch_text: patchResult.patchText,
+        changed_files: patchResult.changedFiles,
         verify_status: "pending",
         cost: {
           provider: cost.provider_cost_usd,
           charge: cost.our_charge_usd
         },
         tokens: {
-          input: Math.round(tokensEstimate * 0.7),
-          output: Math.round(tokensEstimate * 0.3)
+          input: tokensIn,
+          output: tokensOut
         },
         risk_notes: [],
         rollback_notes: []
       }
     });
 
-    emitTaskStage({
+    await emitTaskStage({
       run_id,
       task_id: firstTask.id,
       stage: "SELF_REVIEW",
@@ -1025,7 +1564,7 @@ export async function createServer(options?: {
       plan_id
     });
 
-    emitTaskStage({
+    await emitTaskStage({
       run_id,
       task_id: firstTask.id,
       stage: "PROPOSE_APPLY",
@@ -1046,15 +1585,15 @@ export async function createServer(options?: {
       event_type: "TASK_COMPLETED",
       payload: { patch_path: logicalPatchPath }
     });
-    appendLedgerEvent(db, taskCompleted);
+    await appendLedgerEvent(db, taskCompleted);
 
-    db.exec("UPDATE tasks SET state = ? WHERE run_id = ? AND plan_task_id = ?", [
+    await db.exec("UPDATE tasks SET state = ? WHERE run_id = ? AND plan_task_id = ?", [
       "DONE",
       run_id,
       firstTask.id
     ]);
 
-    const sessionStats = computeSessionStats(run_id);
+    const sessionStats = await computeSessionStats(run_id);
     if (sessionStats) {
       events.emit(run_id, {
         type: "SESSION_STATS",
@@ -1063,7 +1602,7 @@ export async function createServer(options?: {
       });
     }
 
-    db.exec("UPDATE runs SET state = ? WHERE id = ?", ["DONE", run_id]);
+    await db.exec("UPDATE runs SET state = ? WHERE id = ?", ["DONE", run_id]);
     const runCompleted = createLedgerEvent({
       org_id: auth.org_id,
       user_id: auth.user_id,
@@ -1073,7 +1612,7 @@ export async function createServer(options?: {
       event_type: "RUN_COMPLETED",
       payload: {}
     });
-    appendLedgerEvent(db, runCompleted);
+    await appendLedgerEvent(db, runCompleted);
 
     const billingPosted = createLedgerEvent({
       org_id: auth.org_id,
@@ -1084,17 +1623,17 @@ export async function createServer(options?: {
       event_type: "BILLING_POSTED",
       payload: { charge_total: cost.our_charge_usd, provider_total: cost.provider_cost_usd }
     });
-    appendLedgerEvent(db, billingPosted);
+    await appendLedgerEvent(db, billingPosted);
 
     reply.send({ run_id });
   });
 
   app.get("/v1/runs/:run_id/status", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const run_id = (req.params as { run_id: string }).run_id;
-    const run = db.query<Record<string, unknown>>("SELECT * FROM runs WHERE id = ?", [run_id])[0] as
-      | { state: string; current_task_id: string; cost_to_date: number; budget_cap_usd: number }
+    const run = (await db.query<Record<string, unknown>>("SELECT * FROM runs WHERE id = ?", [run_id]))[0] as
+      | { state: string; current_task_id: string; cost_to_date: number | string; budget_cap_usd: number | string }
       | undefined;
 
     if (!run) {
@@ -1102,35 +1641,42 @@ export async function createServer(options?: {
       return;
     }
 
+    const cost_to_date = Number(run.cost_to_date ?? 0);
+    const budget_cap_usd = Number(run.budget_cap_usd ?? 0);
     reply.send({
       state: run.state,
       current_task: run.current_task_id,
-      cost_to_date: run.cost_to_date,
-      budget_remaining: run.budget_cap_usd - run.cost_to_date
+      cost_to_date,
+      budget_remaining: budget_cap_usd - cost_to_date
     });
   });
 
   app.get("/v1/projects/:id/runs", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const project_id = (req.params as { id: string }).id;
-    const runs = db.query(
+    const runs = await db.query(
       "SELECT id, state, lane, risk, cost_to_date, budget_cap_usd, created_at FROM runs WHERE project_id = ? ORDER BY created_at DESC",
       [project_id]
     );
-    reply.send({ runs });
+    const normalized = runs.map((row: any) => ({
+      ...row,
+      cost_to_date: Number(row.cost_to_date ?? 0),
+      budget_cap_usd: Number(row.budget_cap_usd ?? 0)
+    }));
+    reply.send({ runs: normalized });
   });
 
   app.post("/v1/runs/:run_id/pause", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const run_id = (req.params as { run_id: string }).run_id;
-    db.exec("UPDATE runs SET state = ? WHERE id = ?", ["PAUSED", run_id]);
-    const run = db.query<Record<string, unknown>>("SELECT project_id, plan_id FROM runs WHERE id = ?", [run_id])[0] as
+    await db.exec("UPDATE runs SET state = ? WHERE id = ?", ["PAUSED", run_id]);
+    const run = (await db.query<Record<string, unknown>>("SELECT project_id, plan_id FROM runs WHERE id = ?", [run_id]))[0] as
       | { project_id: string; plan_id: string }
       | undefined;
     if (run) {
-      appendLedgerEvent(
+      await appendLedgerEvent(
         db,
         createLedgerEvent({
           org_id: auth.org_id,
@@ -1147,15 +1693,15 @@ export async function createServer(options?: {
   });
 
   app.post("/v1/runs/:run_id/resume", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const run_id = (req.params as { run_id: string }).run_id;
-    db.exec("UPDATE runs SET state = ? WHERE id = ?", ["RUNNING", run_id]);
-    const run = db.query<Record<string, unknown>>("SELECT project_id, plan_id FROM runs WHERE id = ?", [run_id])[0] as
+    await db.exec("UPDATE runs SET state = ? WHERE id = ?", ["RUNNING", run_id]);
+    const run = (await db.query<Record<string, unknown>>("SELECT project_id, plan_id FROM runs WHERE id = ?", [run_id]))[0] as
       | { project_id: string; plan_id: string }
       | undefined;
     if (run) {
-      appendLedgerEvent(
+      await appendLedgerEvent(
         db,
         createLedgerEvent({
           org_id: auth.org_id,
@@ -1172,15 +1718,15 @@ export async function createServer(options?: {
   });
 
   app.post("/v1/runs/:run_id/cancel", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const run_id = (req.params as { run_id: string }).run_id;
-    db.exec("UPDATE runs SET state = ? WHERE id = ?", ["CANCELLED", run_id]);
-    const run = db.query<Record<string, unknown>>("SELECT project_id, plan_id FROM runs WHERE id = ?", [run_id])[0] as
+    await db.exec("UPDATE runs SET state = ? WHERE id = ?", ["CANCELLED", run_id]);
+    const run = (await db.query<Record<string, unknown>>("SELECT project_id, plan_id FROM runs WHERE id = ?", [run_id]))[0] as
       | { project_id: string; plan_id: string }
       | undefined;
     if (run) {
-      appendLedgerEvent(
+      await appendLedgerEvent(
         db,
         createLedgerEvent({
           org_id: auth.org_id,
@@ -1197,19 +1743,169 @@ export async function createServer(options?: {
   });
 
   app.get("/v1/runs/:run_id/stream", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const run_id = (req.params as { run_id: string }).run_id;
     events.attach(run_id, reply.raw);
   });
 
+  async function executeVerify(input: {
+    auth: AuthContext;
+    run_id: string;
+    run: { project_id: string; plan_id: string; lane: string; risk: string; current_task_id: string };
+    mode?: "targeted" | "standard" | "strict";
+    target?: string;
+  }): Promise<{
+    status: "pass" | "fail";
+    report_path: string;
+    gates: Array<{ gate: string; exit_code: number; stdout: string; stderr: string }>;
+  }> {
+    const verifyMode = input.mode ?? resolveVerifyMode(
+      lanePolicy.lanes[input.run.lane as Lane].verify_mode,
+      riskPolicy.risk_levels[input.run.risk as RiskLevel].verify_strictness
+    );
+
+    await emitTaskStage({
+      run_id: input.run_id,
+      task_id: input.run.current_task_id,
+      stage: "LOCAL_VERIFY",
+      message: `verify mode: ${verifyMode}`,
+      org_id: input.auth.org_id,
+      user_id: input.auth.user_id,
+      project_id: input.run.project_id,
+      plan_id: input.run.plan_id
+    });
+
+    const verifyStart = createLedgerEvent({
+      org_id: input.auth.org_id,
+      user_id: input.auth.user_id,
+      project_id: input.run.project_id,
+      run_id: input.run_id,
+      plan_id: input.run.plan_id,
+      event_type: "VERIFY_STARTED",
+      payload: { mode: verifyMode }
+    });
+    await appendLedgerEvent(db, verifyStart);
+
+    const gates = verifyGates.modes[verifyMode].gates;
+    const results: Array<{ gate: string; exit_code: number; stdout: string; stderr: string }> = [];
+
+    for (const gate of gates) {
+      const command = verifyGates.commands[gate];
+      const cmdStart = createLedgerEvent({
+        org_id: input.auth.org_id,
+        user_id: input.auth.user_id,
+        project_id: input.run.project_id,
+        run_id: input.run_id,
+        plan_id: input.run.plan_id,
+        event_type: "RUNNER_CMD_STARTED",
+        payload: { command }
+      });
+      await appendLedgerEvent(db, cmdStart);
+
+      const result = await runnerBridge.sendExec({ project_id: input.run.project_id, cmd: command });
+      results.push({ gate, exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr });
+
+      const stderr = result.stderr ?? "";
+      if (
+        result.exit_code !== 0 &&
+        (stderr.includes("Denied by permissions") || stderr.includes("User denied command"))
+      ) {
+        const reason = stderr.includes("User denied") ? "ask_denied" : "deny";
+        await appendLedgerEvent(
+          db,
+          createLedgerEvent({
+            org_id: input.auth.org_id,
+            user_id: input.auth.user_id,
+            project_id: input.run.project_id,
+            run_id: input.run_id,
+            plan_id: input.run.plan_id,
+            task_id: input.run.current_task_id,
+            event_type: "RUNNER_CMD_BLOCKED",
+            payload: { command, gate, reason }
+          })
+        );
+        events.emit(input.run_id, {
+          type: "PERMISSION_DENIED",
+          ts: new Date().toISOString(),
+          data: {
+            run_id: input.run_id,
+            task_id: input.run.current_task_id,
+            command,
+            gate,
+            reason
+          }
+        });
+      }
+
+      const cmdFinish = createLedgerEvent({
+        org_id: input.auth.org_id,
+        user_id: input.auth.user_id,
+        project_id: input.run.project_id,
+        run_id: input.run_id,
+        plan_id: input.run.plan_id,
+        event_type: "RUNNER_CMD_FINISHED",
+        payload: { command, exit_code: result.exit_code }
+      });
+      await appendLedgerEvent(db, cmdFinish);
+    }
+
+    const allPassed = results.every((r) => r.exit_code === 0);
+    const reportLines = [
+      `# Verify Report (${verifyMode})`,
+      "",
+      input.target ? `Target: ${input.target}` : "",
+      ...results.map((result) => `- ${result.gate}: ${result.exit_code === 0 ? "PASS" : "FAIL"}`)
+    ];
+    const report = reportLines.join("\n");
+    const logicalReportPath = `artifacts/${input.run.project_id}/${input.run_id}/${input.run.current_task_id ?? "task"}/verify-report.md`;
+    const reportArtifact = writeArtifact(input.run_id, "verify-report.md", report);
+
+    const verifyFinish = createLedgerEvent({
+      org_id: input.auth.org_id,
+      user_id: input.auth.user_id,
+      project_id: input.run.project_id,
+      run_id: input.run_id,
+      plan_id: input.run.plan_id,
+      event_type: "VERIFY_FINISHED",
+      payload: { status: allPassed ? "pass" : "fail", report_path: logicalReportPath }
+    });
+    await appendLedgerEvent(db, verifyFinish);
+
+    events.emit(input.run_id, {
+      type: "VERIFY_FINISHED",
+      ts: new Date().toISOString(),
+      data: {
+        run_id: input.run_id,
+        task_id: input.run.current_task_id,
+        status: allPassed ? "pass" : "fail",
+        verify_report: logicalReportPath
+      }
+    });
+
+    const sessionStats = await computeSessionStats(input.run_id);
+    if (sessionStats) {
+      events.emit(input.run_id, {
+        type: "SESSION_STATS",
+        ts: new Date().toISOString(),
+        data: { run_id: input.run_id, ...sessionStats }
+      });
+    }
+
+    return {
+      status: allPassed ? "pass" : "fail",
+      report_path: reportArtifact.path,
+      gates: results
+    };
+  }
+
   app.post("/v1/runs/:run_id/verify", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const run_id = (req.params as { run_id: string }).run_id;
     const body = (req.body ?? {}) as { mode?: "targeted" | "standard" | "strict"; target?: string };
 
-    const run = db.query<Record<string, unknown>>("SELECT * FROM runs WHERE id = ?", [run_id])[0] as
+    const run = (await db.query<Record<string, unknown>>("SELECT * FROM runs WHERE id = ?", [run_id]))[0] as
       | { project_id: string; plan_id: string; lane: string; risk: string; current_task_id: string }
       | undefined;
     if (!run) {
@@ -1222,171 +1918,249 @@ export async function createServer(options?: {
       return;
     }
 
-    const verifyMode = body.mode ?? resolveVerifyMode(
-      lanePolicy.lanes[run.lane as Lane].verify_mode,
-      riskPolicy.risk_levels[run.risk as RiskLevel].verify_strictness
-    );
+    const result = await executeVerify({ auth, run_id, run, mode: body.mode, target: body.target });
+    reply.send(result);
+  });
 
-    emitTaskStage({
-      run_id,
-      task_id: run.current_task_id,
-      stage: "LOCAL_VERIFY",
-      message: `verify mode: ${verifyMode}`,
-      org_id: auth.org_id,
-      user_id: auth.user_id,
-      project_id: run.project_id,
-      plan_id: run.plan_id
-    });
+  app.post("/v1/runs/:run_id/apply", async (req, reply) => {
+    const auth = await requireAuth(req, reply);
+    if (!auth) return;
+    const run_id = (req.params as { run_id: string }).run_id;
+    const body = (req.body ?? {}) as {
+      title?: string;
+      body?: string;
+      draft?: boolean;
+      labels?: string[];
+      reviewers?: string[];
+      assignees?: string[];
+      branch?: string;
+      commit_message?: string;
+    };
 
-    const verifyStart = createLedgerEvent({
-      org_id: auth.org_id,
-      user_id: auth.user_id,
-      project_id: run.project_id,
-      run_id,
-      plan_id: run.plan_id,
-      event_type: "VERIFY_STARTED",
-      payload: { mode: verifyMode }
-    });
-    appendLedgerEvent(db, verifyStart);
-
-    const gates = verifyGates.modes[verifyMode].gates;
-    const results: Array<{ gate: string; exit_code: number; stdout: string; stderr: string }> = [];
-
-    for (const gate of gates) {
-      const command = verifyGates.commands[gate];
-      const cmdStart = createLedgerEvent({
-        org_id: auth.org_id,
-        user_id: auth.user_id,
-        project_id: run.project_id,
-        run_id,
-        plan_id: run.plan_id,
-        event_type: "RUNNER_CMD_STARTED",
-        payload: { command }
-      });
-      appendLedgerEvent(db, cmdStart);
-
-      const result = await runnerBridge.sendExec({ project_id: run.project_id, cmd: command });
-      results.push({ gate, exit_code: result.exit_code, stdout: result.stdout, stderr: result.stderr });
-
-      const stderr = result.stderr ?? "";
-      if (
-        result.exit_code !== 0 &&
-        (stderr.includes("Denied by permissions") || stderr.includes("User denied command"))
-      ) {
-        const reason = stderr.includes("User denied") ? "ask_denied" : "deny";
-        appendLedgerEvent(
-          db,
-          createLedgerEvent({
-            org_id: auth.org_id,
-            user_id: auth.user_id,
-            project_id: run.project_id,
-            run_id,
-            plan_id: run.plan_id,
-            task_id: run.current_task_id,
-            event_type: "RUNNER_CMD_BLOCKED",
-            payload: { command, gate, reason }
-          })
-        );
-        events.emit(run_id, {
-          type: "PERMISSION_DENIED",
-          ts: new Date().toISOString(),
-          data: {
-            run_id,
-            task_id: run.current_task_id,
-            command,
-            gate,
-            reason
-          }
-        });
-      }
-
-      const cmdFinish = createLedgerEvent({
-        org_id: auth.org_id,
-        user_id: auth.user_id,
-        project_id: run.project_id,
-        run_id,
-        plan_id: run.plan_id,
-        event_type: "RUNNER_CMD_FINISHED",
-        payload: { command, exit_code: result.exit_code }
-      });
-      appendLedgerEvent(db, cmdFinish);
+    const run = (await db.query<Record<string, unknown>>("SELECT * FROM runs WHERE id = ?", [run_id]))[0] as
+      | { project_id: string; plan_id: string; lane: string; risk: string; current_task_id: string }
+      | undefined;
+    if (!run) {
+      reply.code(404).send({ error: "run not found" });
+      return;
     }
 
-    const allPassed = results.every((r) => r.exit_code === 0);
-    const reportLines = [
-      `# Verify Report (${verifyMode})`,
-      "",
-      body.target ? `Target: ${body.target}` : "",
-      ...results.map((result) => `- ${result.gate}: ${result.exit_code === 0 ? "PASS" : "FAIL"}`)
-    ];
-    const report = reportLines.join("\n");
-    const logicalReportPath = `artifacts/${run.project_id}/${run_id}/${run.current_task_id ?? "task"}/verify-report.md`;
-    const reportArtifact = writeArtifact(run_id, "verify-report.md", report);
+    if (!runnerBridge.hasRunner(run.project_id)) {
+      reply.code(409).send({ error: "runner not connected" });
+      return;
+    }
 
-    const verifyFinish = createLedgerEvent({
-      org_id: auth.org_id,
-      user_id: auth.user_id,
-      project_id: run.project_id,
+    const taskRow = (await db.query<Record<string, unknown>>(
+      "SELECT title, patch_text FROM tasks WHERE run_id = ? AND plan_task_id = ?",
+      [run_id, run.current_task_id]
+    ))[0] as { title?: string; patch_text?: string } | undefined;
+
+    const patchText = taskRow?.patch_text;
+    if (!patchText) {
+      reply.code(400).send({ error: "no patch available" });
+      return;
+    }
+
+    const verifyResult = await executeVerify({
+      auth,
       run_id,
-      plan_id: run.plan_id,
-      event_type: "VERIFY_FINISHED",
-      payload: { status: allPassed ? "pass" : "fail", report_path: logicalReportPath }
+      run,
+      mode: "strict"
     });
-    appendLedgerEvent(db, verifyFinish);
+    if (verifyResult.status !== "pass") {
+      reply.code(409).send({ error: "verify_failed", report_path: verifyResult.report_path });
+      return;
+    }
 
-    events.emit(run_id, {
-      type: "VERIFY_FINISHED",
-      ts: new Date().toISOString(),
-      data: {
-        run_id,
-        task_id: run.current_task_id,
-        status: allPassed ? "pass" : "fail",
-        verify_report: logicalReportPath
-      }
+    const remoteResult = await runnerBridge.sendExec({
+      project_id: run.project_id,
+      cmd: "git config --get remote.origin.url",
+      cwd: repoRoot
     });
+    if (remoteResult.exit_code !== 0 || !remoteResult.stdout) {
+      reply.code(500).send({ error: "remote_origin_missing" });
+      return;
+    }
+    const repoInfo = parseGitHubRemote(remoteResult.stdout.trim());
+    if (!repoInfo) {
+      reply.code(400).send({ error: "unsupported_remote" });
+      return;
+    }
 
-    const sessionStats = computeSessionStats(run_id);
-    if (sessionStats) {
-      events.emit(run_id, {
-        type: "SESSION_STATS",
-        ts: new Date().toISOString(),
-        data: { run_id, ...sessionStats }
+    const adapter = GitHubAdapter.fromEnv(repoInfo.owner, repoInfo.repo);
+    const baseBranch = await adapter.getDefaultBranch();
+    const branchName = body.branch ?? `trcoder/${run_id}/${run.current_task_id}`;
+
+    const localBranchCheck = await runnerBridge.sendExec({
+      project_id: run.project_id,
+      cmd: `git show-ref --verify --quiet refs/heads/${branchName}`,
+      cwd: repoRoot
+    });
+    if (localBranchCheck.exit_code === 0) {
+      reply.code(409).send({ error: "branch_exists" });
+      return;
+    }
+
+    let remoteBranchExists = false;
+    try {
+      remoteBranchExists = await adapter.branchExists(branchName);
+    } catch (err) {
+      reply.code(502).send({ error: "branch_check_failed", details: (err as Error).message });
+      return;
+    }
+    if (remoteBranchExists) {
+      reply.code(409).send({ error: "branch_exists_remote" });
+      return;
+    }
+
+    const headResult = await runnerBridge.sendExec({
+      project_id: run.project_id,
+      cmd: "git rev-parse HEAD",
+      cwd: repoRoot
+    });
+    if (headResult.exit_code !== 0 || !headResult.stdout) {
+      reply.code(500).send({ error: "git_head_failed", details: headResult.stderr });
+      return;
+    }
+    const headSha = headResult.stdout.trim();
+
+    const patchPath = path.join(repoRoot, ".trcoder", "patches", `apply_${run_id}_${run.current_task_id}.diff`);
+    const worktreePath = path.join(repoRoot, ".trcoder", "worktrees", `${run_id}_${run.current_task_id}`);
+    const writeResult = await runnerBridge.sendWrite({
+      project_id: run.project_id,
+      path: patchPath,
+      content: Buffer.from(patchText, "utf8").toString("base64"),
+      encoding: "base64"
+    });
+    if (writeResult.exit_code !== 0) {
+      reply.code(500).send({ error: "patch_write_failed" });
+      return;
+    }
+
+    let worktreeCreated = false;
+    let pushed = false;
+    try {
+      const worktreeResult = await runnerBridge.sendExec({
+        project_id: run.project_id,
+        cmd: `git worktree add -b ${branchName} \"${worktreePath}\" ${headSha}`,
+        cwd: repoRoot
       });
+      if (worktreeResult.exit_code !== 0) {
+        reply.code(500).send({ error: "git_worktree_failed", details: worktreeResult.stderr });
+        return;
+      }
+      worktreeCreated = true;
+
+      const applyResult = await runnerBridge.sendExec({
+        project_id: run.project_id,
+        cmd: `git apply --index \"${patchPath}\"`,
+        cwd: worktreePath
+      });
+      if (applyResult.exit_code !== 0) {
+        reply.code(500).send({ error: "git_apply_failed", details: applyResult.stderr });
+        return;
+      }
+
+      const commitMessage = body.commit_message ?? `TRCODER: apply ${run.current_task_id}`;
+      const commitResult = await runnerBridge.sendExec({
+        project_id: run.project_id,
+        cmd: `git commit -m \"${commitMessage}\"`,
+        cwd: worktreePath
+      });
+      if (commitResult.exit_code !== 0) {
+        reply.code(500).send({ error: "git_commit_failed", details: commitResult.stderr });
+        return;
+      }
+
+      const pushResult = await runnerBridge.sendExec({
+        project_id: run.project_id,
+        cmd: `git push -u origin ${branchName}`,
+        cwd: worktreePath
+      });
+      if (pushResult.exit_code !== 0) {
+        reply.code(500).send({ error: "git_push_failed", details: pushResult.stderr });
+        return;
+      }
+      pushed = true;
+    } finally {
+      if (worktreeCreated) {
+        await runnerBridge.sendExec({
+          project_id: run.project_id,
+          cmd: `git worktree remove --force \"${worktreePath}\"`,
+          cwd: repoRoot
+        });
+      }
+      if (worktreeCreated && !pushed) {
+        await runnerBridge.sendExec({
+          project_id: run.project_id,
+          cmd: `git branch -D ${branchName}`,
+          cwd: repoRoot
+        });
+      }
+    }
+
+    const prTitle = body.title ?? `TRCODER: ${taskRow?.title ?? run.current_task_id}`;
+    const prBody =
+      body.body ??
+      `Automated by TRCODER\n\nRun: ${run_id}\nTask: ${run.current_task_id}\nBranch: ${branchName}\n`;
+
+    let pr: { number: number; htmlUrl: string };
+    try {
+      pr = await adapter.createPullRequest({
+        title: prTitle,
+        body: prBody,
+        sourceBranch: branchName,
+        targetBranch: baseBranch,
+        labels: body.labels,
+        reviewers: body.reviewers,
+        assignees: body.assignees,
+        draft: body.draft ?? false
+      });
+    } catch (err) {
+      reply.code(502).send({
+        error: "pr_create_failed",
+        details: (err as Error).message,
+        branch: branchName,
+        base_branch: baseBranch
+      });
+      return;
     }
 
     reply.send({
-      status: allPassed ? "pass" : "fail",
-      report_path: reportArtifact.path,
-      gates: results
+      ok: true,
+      branch: branchName,
+      base_branch: baseBranch,
+      pr_number: pr.number,
+      pr_url: pr.htmlUrl
     });
   });
 
   app.get("/v1/usage/month", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
-    const usage = computeUsageForMonth({ db, pricing, plan_id: auth.plan_id });
+    const usage = await computeUsageForMonth({ db, pricing, plan_id: auth.plan_id });
     reply.send(usage);
   });
 
   app.get("/v1/usage/today", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const today = new Date();
     const start = new Date(today.getFullYear(), today.getMonth(), today.getDate());
     const end = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
-    const usage = computeUsageForRange({ db, pricing, plan_id: auth.plan_id, start, end });
+    const usage = await computeUsageForRange({ db, pricing, plan_id: auth.plan_id, start, end });
     reply.send({ ...usage, range: { start: start.toISOString(), end: end.toISOString() } });
   });
 
   app.get("/v1/invoice/preview", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
-    const invoice = computeInvoicePreview({ db, pricing, plan_id: auth.plan_id });
+    const invoice = await computeInvoicePreview({ db, pricing, plan_id: auth.plan_id });
     reply.send(invoice);
   });
 
   app.get("/v1/cost/explain", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const query = req.query as { task_id?: string; run_id?: string };
     if (!query.task_id && !query.run_id) {
@@ -1394,17 +2168,17 @@ export async function createServer(options?: {
       return;
     }
 
-    let row: { router_decision_json?: string } | undefined;
+    let row: { router_decision_json?: unknown } | undefined;
     if (query.task_id) {
-      row = db.query<{ router_decision_json?: string }>(
+      row = (await db.query<{ router_decision_json?: unknown }>(
         "SELECT router_decision_json FROM tasks WHERE plan_task_id = ?",
         [query.task_id]
-      )[0];
+      ))[0];
     } else if (query.run_id) {
-      row = db.query<{ router_decision_json?: string }>(
+      row = (await db.query<{ router_decision_json?: unknown }>(
         "SELECT router_decision_json FROM tasks WHERE run_id = ?",
         [query.run_id]
-      )[0];
+      ))[0];
     }
 
     if (!row?.router_decision_json) {
@@ -1412,26 +2186,29 @@ export async function createServer(options?: {
       return;
     }
 
-    reply.send({ router_decision: JSON.parse(row.router_decision_json) });
+    reply.send({
+      router_decision: parseJsonValue<Record<string, unknown>>(row.router_decision_json, {})
+    });
   });
 
   app.get("/v1/projects/:id/plan/tasks", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const project_id = (req.params as { id: string }).id;
-    const planRow = db.query<{ tasks_json: string }>(
+    const planRow = (await db.query<{ tasks_json: unknown }>(
       "SELECT tasks_json FROM plans WHERE project_id = ? AND approved_at IS NOT NULL ORDER BY approved_at DESC LIMIT 1",
       [project_id]
-    )[0];
+    ))[0];
     if (!planRow) {
       reply.code(404).send({ error: "no approved plan" });
       return;
     }
-    reply.send(JSON.parse(planRow.tasks_json));
+    const tasks = parseJsonValue<Record<string, unknown>>(planRow.tasks_json, {});
+    reply.send(tasks);
   });
 
   app.get("/v1/logs/tail", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const query = req.query as { run_id?: string; limit?: string };
     if (!query.run_id) {
@@ -1439,7 +2216,7 @@ export async function createServer(options?: {
       return;
     }
     const limit = clampInt(Number(query.limit ?? 50), 1, 500);
-    const rows = db.query<{ event_id: string; ts: string; event_type: string; payload_json?: string }>(
+    const rows = await db.query<{ event_id: string; ts: string; event_type: string; payload_json?: unknown }>(
       "SELECT event_id, ts, event_type, payload_json FROM ledger_events WHERE run_id = ? ORDER BY ts DESC LIMIT ?",
       [query.run_id, limit]
     );
@@ -1449,15 +2226,15 @@ export async function createServer(options?: {
         event_id: row.event_id,
         ts: row.ts,
         event_type: row.event_type,
-        payload: JSON.parse(row.payload_json || "{}")
+        payload: parseJsonValue<Record<string, unknown>>(row.payload_json, {})
       }))
     });
   });
 
   app.get("/v1/ledger/export", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
-    const rows = db.query<{
+    const rows = await db.query<{
       event_id: string;
       ts: string;
       org_id: string;
@@ -1467,7 +2244,7 @@ export async function createServer(options?: {
       plan_id?: string;
       task_id?: string;
       event_type: string;
-      payload_json?: string;
+      payload_json?: unknown;
     }>(
       "SELECT event_id, ts, org_id, user_id, project_id, run_id, plan_id, task_id, event_type, payload_json FROM ledger_events ORDER BY ts ASC"
     );
@@ -1483,7 +2260,7 @@ export async function createServer(options?: {
           plan_id: row.plan_id,
           task_id: row.task_id,
           event_type: row.event_type,
-          payload: JSON.parse(row.payload_json || "{}")
+          payload: parseJsonValue<Record<string, unknown>>(row.payload_json, {})
         })
       )
       .join("\n");
@@ -1491,14 +2268,14 @@ export async function createServer(options?: {
   });
 
   app.post("/v1/projects/:id/init", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const project_id = (req.params as { id: string }).id;
     const body = (req.body ?? {}) as { portable?: boolean; refresh?: boolean };
-    const projectRow = db.query<{ repo_name?: string }>(
+    const projectRow = (await db.query<{ repo_name?: string }>(
       "SELECT repo_name FROM projects WHERE id = ?",
       [project_id]
-    )[0];
+    ))[0];
     const repoName = projectRow?.repo_name ?? path.basename(repoRoot);
     const policyNames = ["lane-policy.v1.yaml", "risk-policy.v1.yaml", "permissions.defaults.yaml"];
 
@@ -1558,10 +2335,10 @@ export async function createServer(options?: {
   });
 
   app.get("/v1/packs/:pack_id/stats", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const pack_id = (req.params as { pack_id: string }).pack_id;
-    const record = getContextPackRecord(db, pack_id);
+    const record = await getContextPackRecord(db, pack_id);
     if (!record) {
       reply.code(404).send({ error: "pack not found" });
       return;
@@ -1581,10 +2358,10 @@ export async function createServer(options?: {
   });
 
   app.post("/v1/packs/:pack_id/rebuild", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const pack_id = (req.params as { pack_id: string }).pack_id;
-    const record = getContextPackRecord(db, pack_id);
+    const record = await getContextPackRecord(db, pack_id);
     if (!record) {
       reply.code(404).send({ error: "pack not found" });
       return;
@@ -1592,14 +2369,15 @@ export async function createServer(options?: {
     const pack = record.manifest;
 
     const body = req.body as { budgets?: ContextPackManifest["budgets"]; pins?: string[] };
+    const sanitizedPins = sanitizePins((body.pins ?? pack.pinned_sources).filter(Boolean));
     let newPack = buildContextPack({
       runId: pack.run_id,
       taskId: pack.task_id,
       budgets: body.budgets ?? pack.budgets,
-      pins: body.pins ?? pack.pinned_sources
+      pins: sanitizedPins.pins
     });
     newPack = await enrichContextPack(newPack, record.project_id);
-    saveContextPack(db, { project_id: record.project_id, manifest: newPack });
+    await saveContextPack(db, { project_id: record.project_id, manifest: newPack });
 
     reply.send({
       old_pack_id: pack.pack_id,
@@ -1615,10 +2393,10 @@ export async function createServer(options?: {
   });
 
   app.post("/v1/packs/:pack_id/list", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const pack_id = (req.params as { pack_id: string }).pack_id;
-    const record = getContextPackRecord(db, pack_id);
+    const record = await getContextPackRecord(db, pack_id);
     if (!record) {
       reply.code(404).send({ error: "pack not found" });
       return;
@@ -1651,10 +2429,10 @@ export async function createServer(options?: {
   });
 
   app.post("/v1/packs/:pack_id/read", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const pack_id = (req.params as { pack_id: string }).pack_id;
-    const record = getContextPackRecord(db, pack_id);
+    const record = await getContextPackRecord(db, pack_id);
     if (!record) {
       reply.code(404).send({ error: "pack not found" });
       return;
@@ -1680,7 +2458,7 @@ export async function createServer(options?: {
     if (redacted.masked_count > 0) {
       pack.redaction_stats.masked_entries += redacted.masked_count;
       pack.redaction_stats.masked_chars += redacted.masked_chars;
-      updateContextPack(db, pack);
+      await updateContextPack(db, pack);
     }
     const limited = limitText(redacted.text);
     reply.send({
@@ -1692,10 +2470,10 @@ export async function createServer(options?: {
   });
 
   app.post("/v1/packs/:pack_id/search", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const pack_id = (req.params as { pack_id: string }).pack_id;
-    const record = getContextPackRecord(db, pack_id);
+    const record = await getContextPackRecord(db, pack_id);
     if (!record) {
       reply.code(404).send({ error: "pack not found" });
       return;
@@ -1735,16 +2513,16 @@ export async function createServer(options?: {
       };
     });
     if (pack.redaction_stats.masked_entries > 0) {
-      updateContextPack(db, pack);
+      await updateContextPack(db, pack);
     }
     reply.send({ matches });
   });
 
   app.post("/v1/packs/:pack_id/diff", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const pack_id = (req.params as { pack_id: string }).pack_id;
-    const record = getContextPackRecord(db, pack_id);
+    const record = await getContextPackRecord(db, pack_id);
     if (!record) {
       reply.code(404).send({ error: "pack not found" });
       return;
@@ -1772,17 +2550,17 @@ export async function createServer(options?: {
     if (redacted.masked_count > 0) {
       pack.redaction_stats.masked_entries += redacted.masked_count;
       pack.redaction_stats.masked_chars += redacted.masked_chars;
-      updateContextPack(db, pack);
+      await updateContextPack(db, pack);
     }
     const maxChars = clampInt(Number(body.max_chars ?? MAX_CTX_CHARS), 200, 20000);
     reply.send({ diff: limitText(redacted.text, maxChars) });
   });
 
   app.post("/v1/packs/:pack_id/gitlog", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const pack_id = (req.params as { pack_id: string }).pack_id;
-    const record = getContextPackRecord(db, pack_id);
+    const record = await getContextPackRecord(db, pack_id);
     if (!record) {
       reply.code(404).send({ error: "pack not found" });
       return;
@@ -1810,7 +2588,7 @@ export async function createServer(options?: {
     if (redacted.masked_count > 0) {
       pack.redaction_stats.masked_entries += redacted.masked_count;
       pack.redaction_stats.masked_chars += redacted.masked_chars;
-      updateContextPack(db, pack);
+      await updateContextPack(db, pack);
     }
     const entries = redacted.text
       .split(/\r?\n/)
@@ -1822,27 +2600,27 @@ export async function createServer(options?: {
   });
 
   app.get("/v1/packs/:pack_id/failures", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const pack_id = (req.params as { pack_id: string }).pack_id;
-    const record = getContextPackRecord(db, pack_id);
+    const record = await getContextPackRecord(db, pack_id);
     if (!record) {
       reply.code(404).send({ error: "pack not found" });
       return;
     }
     const pack = record.manifest;
 
-    const row = db.query<{ payload_json?: string }>(
+    const row = (await db.query<{ payload_json?: unknown }>(
       "SELECT payload_json FROM ledger_events WHERE run_id = ? AND event_type = ? ORDER BY ts DESC LIMIT 1",
       [pack.run_id, "VERIFY_FINISHED"]
-    )[0];
+    ))[0];
 
     if (!row?.payload_json) {
       reply.send({ status: "unknown", summary: "" });
       return;
     }
 
-    const payload = JSON.parse(row.payload_json || "{}") as { status?: string; report_path?: string };
+    const payload = parseJsonValue<{ status?: string; report_path?: string }>(row.payload_json, {});
     const reportPath = path.join(getArtifactsDir(), `run-${pack.run_id}`, "verify-report.md");
     let summary = "";
     if (fs.existsSync(reportPath)) {
@@ -1851,7 +2629,7 @@ export async function createServer(options?: {
       if (redacted.masked_count > 0) {
         pack.redaction_stats.masked_entries += redacted.masked_count;
         pack.redaction_stats.masked_chars += redacted.masked_chars;
-        updateContextPack(db, pack);
+        await updateContextPack(db, pack);
       }
       summary = limitText(redacted.text, MAX_CTX_CHARS);
     }
@@ -1864,10 +2642,10 @@ export async function createServer(options?: {
   });
 
   app.post("/v1/packs/:pack_id/logs", async (req, reply) => {
-    const auth = requireAuth(req, reply);
+    const auth = await requireAuth(req, reply);
     if (!auth) return;
     const pack_id = (req.params as { pack_id: string }).pack_id;
-    const record = getContextPackRecord(db, pack_id);
+    const record = await getContextPackRecord(db, pack_id);
     if (!record) {
       reply.code(404).send({ error: "pack not found" });
       return;
@@ -1899,7 +2677,7 @@ export async function createServer(options?: {
     if (redacted.masked_count > 0) {
       pack.redaction_stats.masked_entries += redacted.masked_count;
       pack.redaction_stats.masked_chars += redacted.masked_chars;
-      updateContextPack(db, pack);
+      await updateContextPack(db, pack);
     }
     const lines = tailLines(redacted.text, tail).map((line) => trimSnippet(line, 500));
     reply.send({ source, tail, lines });

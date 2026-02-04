@@ -25,7 +25,7 @@
 - Executor (task state machine)
 - Ledger writer (event-sourcing)
 - Billing calculator + invoice preview
-- Artifact store (local FS in dev, S3 in prod)
+- Artifact store (local FS in dev, R2 in prod)
 
 ## Communication
 - CLI <-> Server:

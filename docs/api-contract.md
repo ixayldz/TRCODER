@@ -19,6 +19,10 @@
   req: { input: { text?, files? }, pins? }
   res: { plan_id, artifacts: [...] }
 
+- POST /v1/projects/:id/chat
+  req: { message? | messages?, lane?, risk?, budget_cap_usd? }
+  res: { message, model, provider, used_fallback, tokens, cost }
+
 - POST /v1/projects/:id/plan/approve
   req: { plan_id, repo_commit }
   res: { ok: true }
@@ -52,6 +56,10 @@
 - POST /v1/runs/:run_id/verify
   req: { mode?, target? }
   res: { status, report_path, gates }
+
+- POST /v1/runs/:run_id/apply
+  req: { title?, body?, draft?, labels?, reviewers?, assignees?, branch?, commit_message? }
+  res: { ok, branch, base_branch, pr_number, pr_url }
 
 - POST /v1/runs/:run_id/pause
 - POST /v1/runs/:run_id/resume
@@ -92,6 +100,7 @@
 - WS /v1/runner/ws
 Server -> CLI messages:
 - RUNNER_EXEC {cmd, cwd, timeout, permission_class}
+- RUNNER_WRITE {path, content, encoding}
 - RUNNER_READ {path, range}
 - RUNNER_GREP {query, scope}
 - RUNNER_LIST {glob, root}

@@ -1,0 +1,120 @@
+# TRCODER Production Stack
+# docker-compose up -d
+
+services:
+  # TRCODER API Server
+  server:
+    build: .
+    ports:
+      - "3333:3333"
+    environment:
+      - NODE_ENV=production
+      - TRCODER_HOST=0.0.0.0
+      - TRCODER_PORT=3333
+
+      # Database
+      - TRCODER_DB_DRIVER=postgres
+      - TRCODER_DB_URL=postgres://trcoder:${DB_PASSWORD:-trcoder123}@postgres:5432/trcoder
+
+      # LLM Providers
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+
+      # Authentication
+      - TRCODER_JWT_SECRET=${JWT_SECRET:-change-this-in-production}
+
+      # Stripe (Billing)
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
+      - STRIPE_SUCCESS_URL=https://${DOMAIN:-localhost}/billing/success
+      - STRIPE_CANCEL_URL=https://${DOMAIN:-localhost}/billing/cancel
+
+      # GitHub (PR Adapter)
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+
+      # S3 Storage
+      - AWS_S3_BUCKET=${AWS_S3_BUCKET:-trcoder-artifacts}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_S3_REGION=${AWS_S3_REGION:-us-east-1}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - trcoder-network
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=trcoder
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-trcoder123}
+      - POSTGRES_DB=trcoder
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U trcoder" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - trcoder-network
+
+  # Redis (Sessions & Rate Limiting)
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - trcoder-network
+
+  # Web Portal (Next.js)
+  portal:
+    build:
+      context: .
+      dockerfile: Dockerfile.portal
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=http://server:3333
+      - NEXTAUTH_URL=https://${DOMAIN:-localhost}
+      - NEXTAUTH_SECRET=${JWT_SECRET:-change-this-in-production}
+    depends_on:
+      - server
+    restart: unless-stopped
+    networks:
+      - trcoder-network
+
+  # Nginx Reverse Proxy (Optional - for SSL)
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - server
+      - portal
+    restart: unless-stopped
+    networks:
+      - trcoder-network
+    profiles:
+      - with-nginx
+
+volumes:
+  postgres_data:
+  redis_data:
+
+
+networks:
+  trcoder-network:
+    driver: bridge

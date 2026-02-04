@@ -5,6 +5,9 @@
 ### Help
 - `/help`
 - `/help <command>`
+- `/status`
+- `/clear`
+- `/exit`
 
 ### Identity
 - `/whoami` -> plan, credits, payg status, org
@@ -19,11 +22,14 @@
 - `/init --refresh` -> re-profile + regenerate managed blocks
 
 ### Plan Mode
-- `/plan` -> enter plan mode
-- `/plan from @<file>` -> pin file + plan generation
+- `chat` mode: non-slash input is treated as a chat request
+- `plan` mode: non-slash input is treated as a plan request
+- `/plan` -> enter/exit plan mode
+- `/plan from @<file>` -> pin file + plan generation (also enters plan mode)
 - `/plan status` -> last plan meta, commit, stale?
 - `/plan diff` -> last approved vs current plan
-- `/plan approve` -> lock plan (immutable)
+- `/plan approve` -> approve latest plan (immutable)
+- `/plan exit` -> leave plan mode
 
 ### Execution
 - `/start` -> start run using approved plan
@@ -44,6 +50,7 @@
 - `/pins add @<file>`
 - `/pins rm @<file>`
 - `/pins list`
+- `/pins clear`
 
 ### Verify / Fix
 - `/verify` -> run default gates

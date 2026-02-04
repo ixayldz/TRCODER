@@ -12,7 +12,7 @@ describe("usage endpoints", () => {
     const now = new Date();
     const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
-    appendLedgerEvent(
+    await appendLedgerEvent(
       db,
       createLedgerEvent({
         org_id: "org_demo",
@@ -33,7 +33,7 @@ describe("usage endpoints", () => {
       })
     );
 
-    appendLedgerEvent(
+    await appendLedgerEvent(
       db,
       createLedgerEvent({
         org_id: "org_demo",

@@ -1,8 +1,9 @@
 import { LedgerEvent } from "@trcoder/shared";
 import { IDb } from "./db";
+import { parseJsonValue } from "./utils/json";
 
-export function appendLedgerEvent(db: IDb, event: LedgerEvent): void {
-  db.exec(
+export async function appendLedgerEvent(db: IDb, event: LedgerEvent): Promise<void> {
+  await db.exec(
     "INSERT INTO ledger_events (event_id, ts, org_id, user_id, project_id, run_id, plan_id, task_id, event_type, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     [
       event.event_id,
@@ -19,22 +20,26 @@ export function appendLedgerEvent(db: IDb, event: LedgerEvent): void {
   );
 }
 
-export function listLedgerEvents(db: IDb, startTs: string, endTs: string): LedgerEvent[] {
-  const rows = db.query<Record<string, string>>(
+export async function listLedgerEvents(
+  db: IDb,
+  startTs: string,
+  endTs: string
+): Promise<LedgerEvent[]> {
+  const rows = await db.query<Record<string, unknown>>(
     "SELECT event_id, ts, org_id, user_id, project_id, run_id, plan_id, task_id, event_type, payload_json FROM ledger_events WHERE ts >= ? AND ts < ? ORDER BY ts ASC",
     [startTs, endTs]
   );
 
   return rows.map((row) => ({
-    event_id: row.event_id,
-    ts: row.ts,
-    org_id: row.org_id,
-    user_id: row.user_id,
-    project_id: row.project_id,
-    run_id: row.run_id,
-    plan_id: row.plan_id,
-    task_id: row.task_id,
+    event_id: String(row.event_id),
+    ts: String(row.ts),
+    org_id: String(row.org_id),
+    user_id: String(row.user_id),
+    project_id: String(row.project_id),
+    run_id: row.run_id as string | null | undefined,
+    plan_id: row.plan_id as string | null | undefined,
+    task_id: row.task_id as string | null | undefined,
     event_type: row.event_type as LedgerEvent["event_type"],
-    payload: JSON.parse(row.payload_json || "{}") as Record<string, unknown>
+    payload: parseJsonValue<Record<string, unknown>>(row.payload_json, {})
   }));
 }

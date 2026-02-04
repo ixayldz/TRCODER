@@ -10,7 +10,7 @@ function startOfNextMonth(date: Date): Date {
   return new Date(date.getFullYear(), date.getMonth() + 1, 1, 0, 0, 0, 0);
 }
 
-export function computeUsageForRange(input: {
+export async function computeUsageForRange(input: {
   db: IDb;
   pricing: PricingConfig;
   plan_id: string;
@@ -20,7 +20,7 @@ export function computeUsageForRange(input: {
   const start = input.start.toISOString();
   const end = input.end.toISOString();
 
-  const events = listLedgerEvents(input.db, start, end).filter(
+  const events = (await listLedgerEvents(input.db, start, end)).filter(
     (event) => event.event_type === "LLM_CALL_FINISHED"
   );
 
@@ -77,7 +77,7 @@ export function computeUsageForRange(input: {
   };
 }
 
-export function computeUsageForMonth(input: {
+export async function computeUsageForMonth(input: {
   db: IDb;
   pricing: PricingConfig;
   plan_id: string;
@@ -86,7 +86,7 @@ export function computeUsageForMonth(input: {
   const monthDate = input.month ?? new Date();
   const start = startOfMonth(monthDate);
   const end = startOfNextMonth(monthDate);
-  const usage = computeUsageForRange({ ...input, start, end });
+  const usage = await computeUsageForRange({ ...input, start, end });
 
   return {
     month: monthDate.toISOString().slice(0, 7),
@@ -94,13 +94,13 @@ export function computeUsageForMonth(input: {
   };
 }
 
-export function computeInvoicePreview(input: {
+export async function computeInvoicePreview(input: {
   db: IDb;
   pricing: PricingConfig;
   plan_id: string;
   month?: Date;
 }) {
-  const usage = computeUsageForMonth(input);
+  const usage = await computeUsageForMonth(input);
   const plan = input.pricing.plans[input.plan_id];
   const monthly_price = plan?.monthly_price_usd ?? 0;
   const minimum_monthly = input.pricing.payg_only.minimum_monthly_charge_usd ?? 0;

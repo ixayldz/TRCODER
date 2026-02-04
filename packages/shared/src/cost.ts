@@ -4,8 +4,7 @@ export const MODEL_PRICING_USD_PER_1K: Record<string, ModelPricing> = {
   "gpt-5.2-xhigh": { input_per_1k: 0.03, output_per_1k: 0.06 },
   "claude-opus-4.5": { input_per_1k: 0.025, output_per_1k: 0.05 },
   "claude-sonnet-4.5": { input_per_1k: 0.01, output_per_1k: 0.03 },
-  "gemini-3.0-pro": { input_per_1k: 0.008, output_per_1k: 0.024 },
-  "deepseek-v3": { input_per_1k: 0.002, output_per_1k: 0.006 }
+  "gemini-3.0-pro": { input_per_1k: 0.008, output_per_1k: 0.024 }
 };
 
 export function getModelPricing(model: string): ModelPricing {

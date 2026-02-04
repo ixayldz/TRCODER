@@ -13,15 +13,15 @@ describe("ledger append-only", () => {
       project_id: "project",
       event_type: "RUN_STARTED"
     });
-    appendLedgerEvent(db, event);
+    await appendLedgerEvent(db, event);
 
     let threw = false;
     try {
-      appendLedgerEvent(db, event);
+      await appendLedgerEvent(db, event);
     } catch {
       threw = true;
     }
     expect(threw).toBe(true);
-    db.close();
+    await db.close();
   });
 });

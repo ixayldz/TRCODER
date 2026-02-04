@@ -1,16 +1,8 @@
 import path from "path";
 import { ApiClient } from "./api-client";
 import { CliConfig, loadConfig, saveConfig } from "./config-store";
-
-async function getRepoCommit(): Promise<string> {
-  try {
-    const { execSync } = await import("child_process");
-    const output = execSync("git log -1 --format=%H").toString().trim();
-    return output || "DEV";
-  } catch {
-    return "DEV";
-  }
-}
+import { ensureLocalServerRunning } from "./local-server";
+import { getRepoIdentityHash } from "./repo";
 
 export async function connectCommand(args: string[]): Promise<void> {
   const config = loadConfig();
@@ -25,9 +17,15 @@ export async function connectCommand(args: string[]): Promise<void> {
     }
   }
 
+  await ensureLocalServerRunning({
+    serverUrl: config.server_url,
+    apiKey: config.api_key,
+    log: (message) => console.log(message)
+  });
+
   const api = new ApiClient(config as CliConfig);
   const repo_name = path.basename(process.cwd());
-  const repo_root_hash = await getRepoCommit();
+  const repo_root_hash = await getRepoIdentityHash();
   const res = await api.post<{ project_id: string }>("/v1/projects/connect", {
     repo_name,
     repo_root_hash

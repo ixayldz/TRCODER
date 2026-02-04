@@ -30,6 +30,7 @@ No “dangerously-skip-permissions” by default.
 ## 6) Apply Guardrail
 /apply triggers:
 - strict verify gates
+- patch file write (RUNNER_WRITE)
 - then patch apply in isolated worktree
 - then commit/push/PR
 

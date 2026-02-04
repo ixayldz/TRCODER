@@ -5,6 +5,69 @@ Premium policy-driven agentic coding CLI. Plan-first, patch-first, and PR-first.
 ## What it is
 TRCODER is a server-orchestrated CLI that turns slash commands into a controlled software delivery workflow. It enforces strict policy boundaries and produces auditable artifacts and ledger events for every run.
 
+## Goals and philosophy
+- **Deterministic control**: user never selects a model; the router enforces policy and budgets.
+- **Auditability**: every decision, cost, and action is recorded in the ledger.
+- **Safety by default**: patch-first + PR-first + permissioned runner.
+- **Repeatable delivery**: plan approval gates runs; verify gates block apply.
+
+## How it works (end-to-end)
+1) **Plan**: You enter plan mode and describe the work.  
+   - The server produces a `tasks.v1` plan and a human-readable plan artifact.
+2) **Approve**: You approve the latest plan; approval is tracked with commit metadata.
+3) **Run**: `/start` selects the next task and generates a patch artifact (no repo writes).
+4) **Verify**: verify gates execute locally through the runner (typecheck/tests/lint/build).
+5) **Apply**: `/apply` runs **strict** verify and then applies the patch (PR-first).
+
+This gives a Claude Code/Codex CLI-like UX while keeping policy in control.
+
+## Model routing and roles
+TRCODER uses `config/model-stack.v2.json` to map task types to models. The router decides:
+- **Planner**: `project_planning` (plan generation)
+- **Coder**: tasks like `backend_development`, `frontend_development`, `database_code`
+- **Reviewer**: `quick_review` / `deep_review` / `security_audit`
+
+Routing is influenced by:
+- **Lane** (speed/balanced/quality/cost-saver)
+- **Risk** (low/standard/high)
+- **Budget** (remaining USD and credits)
+- **Context budget** (files/lines/graph depth)
+- **Provider availability** + fallback chains
+
+User never picks models; the router is the only selector.
+
+## Execution lifecycle (detail)
+- **Plan mode**: `/plan` enters plan mode; any non-slash input becomes a plan request.
+- **Plan approval**: `/plan approve` locks the latest plan for execution.
+- **Run**: `/start` triggers server-side orchestration + local runner execution.
+- **Patch-first**: patch is generated and stored as an artifact; repo is untouched.
+- **Verify**: `/verify` runs configured gates; results are persisted to artifacts + ledger.
+- **Apply (PR-first)**: `/apply` runs strict verify and only then applies the patch.
+
+## Runner and permissions
+Runner runs locally and executes only allowed operations. Policies:
+- **allow**: safe read-only and standard verify commands
+- **ask**: potentially destructive or network operations
+- **deny**: clearly dangerous commands
+
+Defaults live in `config/permissions.defaults.yaml`.  
+Local overrides live in `~/.trcoder/permissions.json`.
+
+## Artifacts and ledger
+TRCODER stores every important output:
+- Plan artifacts (`plan.md`, `tasks.v1.json`, `risks.md`)
+- Patch artifacts (`patch.diff`)
+- Verify reports
+- Run summaries
+
+Ledger events are append-only and drive billing.  
+Examples: `LLM_CALL_FINISHED`, `PATCH_PRODUCED`, `VERIFY_FINISHED`, `BILLING_POSTED`.
+
+## Provider behavior
+- **Mock provider** is used when keys are missing or `TRCODER_USE_MOCK_PROVIDER=true`.
+- If keys exist and mock is disabled, real providers are used automatically.
+- Fallback chains are defined in `model-stack.v2.json`.
+
 ## Non-negotiables (V1)
 - No model selection by user (router only).
 - Patch-first: `/start` generates patch artifacts only, no repo writes.
@@ -120,6 +183,8 @@ Server:
 - `PORT` / `HOST` - listen address
 - `TRCODER_DB_DRIVER=sqljs|postgres`
 - `TRCODER_DB_PATH` - sql.js persistence path (omit for in-memory)
+- `TRCODER_DATA_DIR` - base data directory override (artifacts + db)
+- `TRCODER_ARTIFACTS_DIR` - artifacts directory override
 - `TRCODER_CONFIG_ROOT` - config root override
 - `TRCODER_MODEL_STACK_PATH`
 - `TRCODER_LANE_POLICY_PATH`
@@ -139,6 +204,10 @@ artifacts/{project_id}/{run_id}/{task_id}/verify-report.md
 artifacts/{project_id}/{run_id}/task-summary.json
 artifacts/{project_id}/{run_id}/run-summary.json
 ```
+
+## Plan stale and dirty working tree
+TRCODER will warn if the approved plan commit does not match the current repo state
+or if the working tree is dirty. You must explicitly confirm before `/start` proceeds.
 
 ## Permissions model
 Runner commands are classified into:
@@ -197,9 +266,9 @@ pnpm -w lint
 ```
 
 ## Known limitations (V1)
-- Model provider is mocked (no real LLM integration yet).
+- LLM providers require API keys; mock provider is used when no keys are configured.
 - PR adapter is a stub (no GitHub/GitLab integration).
-- Postgres adapter is a stub (sql.js only for dev/test).
+- Postgres is supported via `TRCODER_DB_DRIVER=postgres` but needs env setup.
 - Context pack retrieval is simple pins/signals only.
 
 ## Security notes

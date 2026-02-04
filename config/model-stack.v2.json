@@ -4,8 +4,7 @@
     "gpt-5.2-xhigh": { "provider": "openai", "tier": "premium_reasoning" },
     "claude-opus-4.5": { "provider": "anthropic", "tier": "premium" },
     "claude-sonnet-4.5": { "provider": "anthropic", "tier": "standard" },
-    "gemini-3.0-pro": { "provider": "google", "tier": "standard" },
-    "deepseek-v3": { "provider": "deepseek", "tier": "economy" }
+    "gemini-3.0-pro": { "provider": "google", "tier": "standard" }
   },
   "task_type_map": {
     "idea_validation": { "model": "gpt-5.2-xhigh", "reason": "strong reasoning, business analysis" },

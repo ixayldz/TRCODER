@@ -1,0 +1,69 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root {
+  --foreground-rgb: 255, 255, 255;
+  --background-start-rgb: 10, 10, 20;
+  --background-end-rgb: 20, 20, 40;
+}
+
+body {
+  color: rgb(var(--foreground-rgb));
+  background: linear-gradient(
+    135deg,
+    rgb(var(--background-start-rgb)) 0%,
+    rgb(var(--background-end-rgb)) 100%
+  );
+  min-height: 100vh;
+}
+
+/* Glassmorphism utilities */
+@layer utilities {
+  .glass {
+    background: rgba(255, 255, 255, 0.05);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+  }
+  
+  .glass-dark {
+    background: rgba(0, 0, 0, 0.3);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+  }
+  
+  .gradient-text {
+    background: linear-gradient(135deg, #0ea5e9 0%, #d946ef 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  
+  .btn-primary {
+    @apply px-6 py-3 bg-gradient-to-r from-primary-500 to-accent-500 rounded-lg font-semibold;
+    @apply hover:from-primary-400 hover:to-accent-400 transition-all duration-300;
+    @apply shadow-lg hover:shadow-xl hover:shadow-primary-500/20;
+  }
+  
+  .btn-secondary {
+    @apply px-6 py-3 glass rounded-lg font-semibold;
+    @apply hover:bg-white/10 transition-all duration-300;
+  }
+  
+  .input-field {
+    @apply w-full px-4 py-3 bg-white/5 border border-white/10 rounded-lg;
+    @apply focus:outline-none focus:border-primary-500 focus:ring-1 focus:ring-primary-500;
+    @apply placeholder-white/40 transition-all duration-300;
+  }
+  
+  .card {
+    @apply glass rounded-2xl p-6;
+  }
+  
+  .card-hover {
+    @apply card hover:bg-white/10 transition-all duration-300;
+    @apply hover:border-primary-500/50 cursor-pointer;
+  }
+}

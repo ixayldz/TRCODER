@@ -26,18 +26,20 @@ export class RunnerBridge {
   private wss: WebSocketServer;
   private connections = new Map<string, RunnerConnection>();
   private permissions: PermissionsConfig;
-  private onAuthFailed?: (req: IncomingMessage, reason: string) => void;
-  private authorize: (req: IncomingMessage) => {
+  private onAuthFailed?: (req: IncomingMessage, reason: string) => Promise<void> | void;
+  private authorize: (req: IncomingMessage) => Promise<{
     project_id: string;
     org_id: string;
     user_id: string;
-  } | null;
+  } | null>;
 
   constructor(
     server: Server,
     permissions: PermissionsConfig,
-    authorize: (req: IncomingMessage) => { project_id: string; org_id: string; user_id: string } | null,
-    onAuthFailed?: (req: IncomingMessage, reason: string) => void
+    authorize: (
+      req: IncomingMessage
+    ) => Promise<{ project_id: string; org_id: string; user_id: string } | null>,
+    onAuthFailed?: (req: IncomingMessage, reason: string) => Promise<void> | void
   ) {
     this.permissions = permissions;
     this.authorize = authorize;
@@ -45,65 +47,69 @@ export class RunnerBridge {
     this.wss = new WebSocketServer({ server, path: "/v1/runner/ws" });
 
     this.wss.on("connection", (socket, req) => {
-      const auth = this.authorize(req);
-      if (!auth) {
-        this.onAuthFailed?.(req, "unauthorized");
-        socket.close();
-        return;
+      void this.handleConnection(socket, req);
+    });
+  }
+
+  private async handleConnection(socket: WebSocket, req: IncomingMessage): Promise<void> {
+    const auth = await this.authorize(req);
+    if (!auth) {
+      await this.onAuthFailed?.(req, "unauthorized");
+      socket.close();
+      return;
+    }
+    const pending = new Map<string, (result: RunnerResult) => void>();
+    let connection: RunnerConnection | null = null;
+
+    socket.on("message", (raw) => {
+      try {
+        const message = JSON.parse(String(raw));
+        if (message.type === "HELLO") {
+          if (message.project_id !== auth.project_id) {
+            void this.onAuthFailed?.(req, "project_mismatch");
+            socket.close();
+            return;
+          }
+          const session_id = randomUUID();
+          connection = {
+            socket,
+            project_id: auth.project_id,
+            org_id: auth.org_id,
+            user_id: auth.user_id,
+            session_id,
+            pending
+          };
+          this.connections.set(auth.project_id, connection);
+          socket.send(
+            JSON.stringify({
+              type: "HELLO_ACK",
+              ts: new Date().toISOString(),
+              runner_session_id: session_id
+            })
+          );
+          return;
+        }
+
+        if (message.type === "RUNNER_RESULT" && connection) {
+          if (message.runner_session_id !== connection.session_id) {
+            return;
+          }
+          const handler = pending.get(message.request_id);
+          if (handler) {
+            pending.delete(message.request_id);
+            handler(message as RunnerResult);
+          }
+          return;
+        }
+      } catch {
+        // ignore invalid messages
       }
-      const pending = new Map<string, (result: RunnerResult) => void>();
-      let connection: RunnerConnection | null = null;
+    });
 
-      socket.on("message", (raw) => {
-        try {
-          const message = JSON.parse(String(raw));
-          if (message.type === "HELLO") {
-            if (message.project_id !== auth.project_id) {
-              this.onAuthFailed?.(req, "project_mismatch");
-              socket.close();
-              return;
-            }
-            const session_id = randomUUID();
-            connection = {
-              socket,
-              project_id: auth.project_id,
-              org_id: auth.org_id,
-              user_id: auth.user_id,
-              session_id,
-              pending
-            };
-            this.connections.set(auth.project_id, connection);
-            socket.send(
-              JSON.stringify({
-                type: "HELLO_ACK",
-                ts: new Date().toISOString(),
-                runner_session_id: session_id
-              })
-            );
-            return;
-          }
-
-          if (message.type === "RUNNER_RESULT" && connection) {
-            if (message.runner_session_id !== connection.session_id) {
-              return;
-            }
-            const handler = pending.get(message.request_id);
-            if (handler) {
-              pending.delete(message.request_id);
-              handler(message as RunnerResult);
-            }
-            return;
-          }
-        } catch {
-          // ignore invalid messages
-        }
-      });
-
-      socket.on("close", () => {
-        if (connection) {
-          this.connections.delete(connection.project_id);
-        }
-      });
+    socket.on("close", () => {
+      if (connection) {
+        this.connections.delete(connection.project_id);
+      }
     });
   }
 
@@ -174,6 +180,21 @@ export class RunnerBridge {
       glob: input.glob,
       root: input.root,
       limit: input.limit
+    });
+  }
+
+  async sendWrite(input: {
+    project_id: string;
+    path: string;
+    content: string;
+    encoding?: "utf8" | "base64";
+  }): Promise<RunnerResult> {
+    return this.sendRequest(input.project_id, {
+      type: "RUNNER_WRITE",
+      runner_session_id: this.getConnection(input.project_id).session_id,
+      path: input.path,
+      content: input.content,
+      encoding: input.encoding ?? "utf8"
     });
   }
 

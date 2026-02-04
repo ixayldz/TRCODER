@@ -9,7 +9,7 @@ describe("invoice preview", () => {
     process.env.TRCODER_DB_PATH = ":memory:";
     const { app, db } = await createServer();
 
-    appendLedgerEvent(
+    await appendLedgerEvent(
       db,
       createLedgerEvent({
         org_id: "org_demo",
@@ -29,7 +29,7 @@ describe("invoice preview", () => {
       })
     );
 
-    appendLedgerEvent(
+    await appendLedgerEvent(
       db,
       createLedgerEvent({
         org_id: "org_demo",

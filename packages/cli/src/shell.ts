@@ -1,9 +1,8 @@
 import readline from "readline";
 import fs from "fs";
-import path from "path";
 import os from "os";
-import { spawnSync } from "child_process";
-import { classifyCommand, PermissionsConfig, loadRiskPolicy } from "@trcoder/shared";
+import path from "path";
+import { PermissionsConfig, loadRiskPolicy } from "@trcoder/shared";
 import { ApiClient } from "./api-client";
 import { CliConfig, loadConfig, saveConfig } from "./config-store";
 import { streamRunEvents } from "./sse-client";
@@ -19,6 +18,9 @@ import { getHelpLines, HELP_MAP } from "./help";
 import { loadPermissionPolicy } from "./permissions";
 import { RunnerClient } from "./runner-client";
 import { parseSlashCommand } from "./parser";
+import { styleText } from "./theme";
+import { ensureLocalServerRunning } from "./local-server";
+import { getRepoCommit, getRepoIdentityHash } from "./repo";
 
 export class Shell {
   private rl: readline.Interface;
@@ -27,6 +29,8 @@ export class Shell {
   private runner: RunnerClient;
   private streamingRuns = new Set<string>();
   private permissions: PermissionsConfig;
+  private planMode = false;
+  private chatHistory: Array<{ role: "user" | "assistant"; content: string }> = [];
 
   constructor() {
     this.config = loadConfig();
@@ -45,13 +49,25 @@ export class Shell {
   }
 
   async start(): Promise<void> {
-    if (!this.config.project_id) {
-      console.log("No project connected. Run: trcoder connect");
-      this.rl.close();
-      return;
+    await ensureLocalServerRunning({
+      serverUrl: this.config.server_url,
+      apiKey: this.config.api_key,
+      log: (message) => console.log(styleText(message, "muted"))
+    });
+
+    // Claude Code-like: automatically connect the current repo on shell start.
+    const repo_name = path.basename(process.cwd());
+    const repo_root_hash = await getRepoIdentityHash();
+    const connected = await this.api.post<{ project_id: string }>("/v1/projects/connect", {
+      repo_name,
+      repo_root_hash
+    });
+    if (this.config.project_id !== connected.project_id) {
+      this.config.project_id = connected.project_id;
+      saveConfig(this.config);
     }
 
-    this.runner.connect();
+    this.runner.setProjectId(connected.project_id);
     this.printPrompt();
 
     this.rl.on("line", async (line) => {
@@ -71,7 +87,9 @@ export class Shell {
 
   private printPrompt(): void {
     const project = this.config.project_id ?? "unknown";
-    this.rl.setPrompt(`trcoder[${project}]> `);
+    const mode = this.planMode ? "plan" : "chat";
+    const prompt = `trcoder[${project}] ${mode}> `;
+    this.rl.setPrompt(styleText(prompt, "prompt"));
     this.rl.prompt();
   }
 
@@ -92,9 +110,27 @@ export class Shell {
   }
 
   private async handleCommand(input: string): Promise<void> {
+    if (input.startsWith("!")) {
+      await this.cmdBang(input.slice(1).trim());
+      return;
+    }
+
     const parsed = parseSlashCommand(input);
     if (!parsed) {
-      console.log("Commands must start with /");
+      if (this.looksLikeShellCommand(input)) {
+        console.log(
+          styleText(
+            "Looks like a shell command. Run it in PowerShell, or prefix with ! (example: ! pnpm test).",
+            "muted"
+          )
+        );
+        return;
+      }
+      if (this.planMode) {
+        await this.submitPlanText(input);
+      } else {
+        await this.submitChatText(input);
+      }
       return;
     }
 
@@ -104,6 +140,15 @@ export class Shell {
     switch (command) {
       case "help":
         this.printHelp(tokens[0]);
+        break;
+      case "exit":
+        this.cmdExit();
+        break;
+      case "clear":
+        this.cmdClear();
+        break;
+      case "status":
+        await this.cmdStatus();
         break;
       case "whoami":
         await this.cmdWhoami();
@@ -205,9 +250,19 @@ export class Shell {
   }
 
   private async cmdPlan(args: string[]): Promise<void> {
+    if (args[0] === "exit") {
+      if (!this.planMode) {
+        console.log("Plan mode is not active.");
+        return;
+      }
+      this.planMode = false;
+      console.log("Plan mode disabled.");
+      return;
+    }
+
     if (args[0] === "status") {
       const status = await this.api.get<any>(`/v1/projects/${this.config.project_id}/plan/status`);
-      const localCommit = await this.getRepoCommit();
+      const localCommit = await getRepoCommit();
       console.log(JSON.stringify({ ...status, local_repo_commit: localCommit }, null, 2));
       return;
     }
@@ -226,17 +281,27 @@ export class Shell {
 
     if (args[0] === "approve") {
       const status = await this.api.get<any>(`/v1/projects/${this.config.project_id}/plan/status`);
-      const planId = status.approved_plan_id ?? status.latest_plan_id ?? this.config.last_plan_id;
+      const planId = status.latest_plan_id ?? status.approved_plan_id ?? this.config.last_plan_id;
       if (!planId) {
         console.log("No plan to approve.");
         return;
       }
-      const commit = await this.getRepoCommit();
+      const commit = await getRepoCommit();
       await this.api.post(`/v1/projects/${this.config.project_id}/plan/approve`, {
         plan_id: planId,
         repo_commit: commit
       });
       console.log(`Plan approved: ${planId}`);
+      return;
+    }
+
+    if (!args[0]) {
+      this.planMode = !this.planMode;
+      console.log(
+        this.planMode
+          ? "Plan mode enabled. Type your request, or /plan exit to leave."
+          : "Plan mode disabled."
+      );
       return;
     }
 
@@ -249,15 +314,148 @@ export class Shell {
       if (!pins.includes(filePath)) {
         pins.push(filePath);
       }
+    } else if (args[0] !== "from") {
+      // Claude Code-like: /plan <free text>
+      input = { text: args.join(" ") };
     }
 
     const res = await this.api.post<any>(`/v1/projects/${this.config.project_id}/plan`, {
       input,
-      pins
+      pins,
+      lane: this.config.lane,
+      risk: this.config.risk,
+      budget_cap_usd: this.config.budget_cap_usd
     });
     this.config.last_plan_id = res.plan_id;
     saveConfig(this.config);
+    this.printPlanResponse(res);
+    this.planMode = true; // /plan always enters plan mode
+  }
+
+  private async submitChatText(text: string): Promise<void> {
+    const nextMessages = [...this.chatHistory, { role: "user" as const, content: text }];
+    const res = await this.api.post<any>(`/v1/projects/${this.config.project_id}/chat`, {
+      messages: nextMessages,
+      lane: this.config.lane,
+      risk: this.config.risk,
+      budget_cap_usd: this.config.budget_cap_usd
+    });
+
+    const assistantText = String(res.message ?? "");
+    this.chatHistory = [...nextMessages, { role: "assistant" as const, content: assistantText }].slice(-20);
+
+    console.log(styleText("assistant>", "stage"), assistantText);
+    if (res.model || res.provider) {
+      const meta = `(${res.provider ?? "provider"} / ${res.model ?? "model"})`;
+      console.log(styleText(meta, "muted"));
+    }
+  }
+
+  private async submitPlanText(text: string): Promise<void> {
+    const payload = {
+      input: { text },
+      pins: [...(this.config.pins ?? [])],
+      lane: this.config.lane,
+      risk: this.config.risk,
+      budget_cap_usd: this.config.budget_cap_usd
+    };
+    const res = await this.api.post<any>(`/v1/projects/${this.config.project_id}/plan`, payload);
+    this.config.last_plan_id = res.plan_id;
+    saveConfig(this.config);
+    this.printPlanResponse(res);
+  }
+
+  private looksLikeShellCommand(input: string): boolean {
+    const token = input.trim().split(/\s+/)[0]?.toLowerCase();
+    if (!token) return false;
+    const known = new Set([
+      "pnpm",
+      "npm",
+      "npx",
+      "yarn",
+      "node",
+      "git",
+      "cd",
+      "dir",
+      "ls",
+      "type",
+      "cat",
+      "rg",
+      "python",
+      "pytest",
+      "docker",
+      "docker-compose",
+      "kubectl",
+      "go",
+      "cargo",
+      "dotnet"
+    ]);
+    return known.has(token);
+  }
+
+  private async cmdBang(command: string): Promise<void> {
+    if (!command) {
+      console.log("Usage: ! <command>");
+      return;
+    }
+    const { spawn } = await import("child_process");
+
+    this.rl.pause();
+    await new Promise<void>((resolve) => {
+      const child = spawn(command, {
+        shell: true,
+        stdio: "inherit",
+        windowsHide: true
+      });
+      child.on("exit", (code) => {
+        this.rl.resume();
+        if (typeof code === "number" && code !== 0) {
+          console.log(styleText(`(exit ${code})`, "muted"));
+        }
+        resolve();
+      });
+      child.on("error", (err) => {
+        this.rl.resume();
+        console.log(`command error: ${err.message}`);
+        resolve();
+      });
+    });
+  }
+
+  private printPlanResponse(res: any): void {
+    console.log(styleText("=== PLAN ===", "header"));
     console.log(`Plan created: ${res.plan_id}`);
+    if (res.plan_md) {
+      console.log(res.plan_md);
+    }
+  }
+
+  private cmdExit(): void {
+    this.rl.close();
+    process.exit(0);
+  }
+
+  private cmdClear(): void {
+    // Clear screen + keep current mode.
+    console.clear();
+  }
+
+  private async cmdStatus(): Promise<void> {
+    const runner = this.runner.getStatus();
+    console.log(
+      JSON.stringify(
+        {
+          server_url: this.config.server_url,
+          project_id: this.config.project_id,
+          mode: this.planMode ? "plan" : "chat",
+          last_plan_id: this.config.last_plan_id ?? null,
+          last_run_id: this.config.last_run_id ?? null,
+          runner
+        },
+        null,
+        2
+      )
+    );
   }
 
   private async cmdStart(args: string[]): Promise<void> {
@@ -652,7 +850,7 @@ export class Shell {
   }
 
   private async cmdApply(): Promise<void> {
-    if (!this.config.last_run_id || !this.config.last_patch?.text) {
+    if (!this.config.last_run_id) {
       console.log("No patch available to apply.");
       return;
     }
@@ -663,50 +861,8 @@ export class Shell {
       return;
     }
 
-    const verify = await this.api.post<any>(`/v1/runs/${this.config.last_run_id}/verify`, {
-      mode: "strict"
-    });
-    if (verify.status !== "pass") {
-      console.log("Strict verify failed. Aborting apply.");
-      return;
-    }
-
-    const patchFile = path.join(os.tmpdir(), `trcoder_patch_${this.config.last_run_id}.diff`);
-    fs.writeFileSync(patchFile, this.config.last_patch.text, "utf8");
-
-    const taskId = this.config.last_task_id ?? "patch";
-    const branchName = `trcoder/${this.config.last_run_id}/${taskId}`;
-    const worktreeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "trcoder-worktree-"));
-
-    const worktreeCmd = `git worktree add -b ${branchName} \"${worktreeRoot}\"`;
-    const worktreeOutcome = await this.runLocalCommandInteractive(worktreeCmd, process.cwd());
-    if (!worktreeOutcome.ok) {
-      console.log("Worktree add failed. Aborting apply.");
-      console.log(worktreeOutcome.stderr || worktreeOutcome.stdout);
-      return;
-    }
-    let worktreeCreated = true;
-
-    const applyCmd = `git -C \"${worktreeRoot}\" apply --index \"${patchFile}\"`;
-    const commitCmd = `git -C \"${worktreeRoot}\" commit -m \"TRCODER: apply ${taskId}\"`;
-    const pushCmd = `git -C \"${worktreeRoot}\" push -u origin ${branchName}`;
-
-    try {
-      const commands = [applyCmd, commitCmd, pushCmd];
-      for (const cmd of commands) {
-        const outcome = await this.runLocalCommandInteractive(cmd, worktreeRoot);
-        if (!outcome.ok) {
-          console.log(`Command failed: ${cmd}`);
-          console.log(outcome.stderr || outcome.stdout);
-          return;
-        }
-      }
-      console.log(`Apply complete on branch ${branchName} (PR adapter stub).`);
-    } finally {
-      if (worktreeCreated) {
-        await this.runLocalCommandInteractive(`git worktree remove \"${worktreeRoot}\"`, process.cwd());
-      }
-    }
+    const res = await this.api.post<any>(`/v1/runs/${this.config.last_run_id}/apply`, {});
+    console.log(`PR created: ${res.pr_url ?? "n/a"}`);
   }
 
   private async cmdUsage(args: string[]): Promise<void> {
@@ -829,6 +985,12 @@ export class Shell {
       console.log(JSON.stringify(this.config.pins, null, 2));
       return;
     }
+    if (action === "clear") {
+      this.config.pins = [];
+      saveConfig(this.config);
+      console.log("Pins cleared.");
+      return;
+    }
     if (action === "add" && target?.startsWith("@")) {
       const pathValue = target.slice(1);
       if (!this.config.pins.includes(pathValue)) {
@@ -845,7 +1007,7 @@ export class Shell {
       console.log(`Unpinned: ${pathValue}`);
       return;
     }
-    console.log("Usage: /pins add @<file> | /pins rm @<file> | /pins list");
+    console.log("Usage: /pins add @<file> | /pins rm @<file> | /pins list | /pins clear");
   }
 
   private async cmdDoctor(): Promise<void> {
@@ -900,7 +1062,18 @@ export class Shell {
 
   private async cmdProject(args: string[]): Promise<void> {
     if (args[0] === "connect") {
-      console.log("Use: trcoder connect (outside shell) to connect a project.");
+      const repo_name = path.basename(process.cwd());
+      const repo_root_hash = await getRepoIdentityHash();
+      const res = await this.api.post<{ project_id: string }>("/v1/projects/connect", {
+        repo_name,
+        repo_root_hash
+      });
+
+      this.config.project_id = res.project_id;
+      saveConfig(this.config);
+      this.runner.setProjectId(res.project_id);
+
+      console.log(`Connected project: ${res.project_id}`);
       return;
     }
     if (args[0] !== "status") {
@@ -947,42 +1120,4 @@ export class Shell {
     await this.cmdStart(["--task", nextTask.id]);
   }
 
-  private async getRepoCommit(): Promise<string> {
-    try {
-      const { execSync } = await import("child_process");
-      const output = execSync("git log -1 --format=%H").toString().trim();
-      return output || "DEV";
-    } catch {
-      return "DEV";
-    }
-  }
-
-  private async runLocalCommandInteractive(
-    cmd: string,
-    cwd: string
-  ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-    const permission = classifyCommand(cmd, this.permissions);
-    if (permission === "deny") {
-      return { ok: false, stdout: "", stderr: "Denied by permissions" };
-    }
-    if (permission === "ask") {
-      const allowed = await this.promptYesNo(`Allow command? ${cmd}`);
-      if (!allowed) {
-        return { ok: false, stdout: "", stderr: "User denied command" };
-      }
-    }
-
-    const result = spawnSync(cmd, {
-      shell: true,
-      cwd,
-      windowsHide: true,
-      encoding: "utf8"
-    });
-
-    return {
-      ok: result.status === 0,
-      stdout: result.stdout ?? "",
-      stderr: result.stderr ?? ""
-    };
-  }
 }
